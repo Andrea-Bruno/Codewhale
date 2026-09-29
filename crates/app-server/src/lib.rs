@@ -1126,6 +1126,10 @@ struct BridgedTurn<'a> {
     /// Forget the thread mapping once the turn ends. Set for one-shot
     /// prompts, whose synthetic thread key no client can name again.
     ephemeral: bool,
+    /// Refuse a `thread_key` that is neither mapped, durably linked, nor a
+    /// persisted thread, instead of minting an empty runtime thread for it.
+    /// Set by `thread/message`, whose ids come from `thread/create`.
+    require_known_thread: bool,
 }
 
 /// Execute exactly one turn on the real runtime.
@@ -1148,12 +1152,18 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     if let Some(model) = turn.model_override {
         hint.get_or_insert_with(RuntimeThreadHint::default).model = Some(model);
     }
-    let bridge = acquire_runtime_bridge(state).await?;
+    // Resolve the thread before touching the runtime, so an unknown id never
+    // spawns a child or mints a thread.
+    let link_thread = if turn.ephemeral {
+        false
+    } else {
+        restore_thread_link(state, turn.thread_key, turn.require_known_thread).await?
+    };
     // The inner bridge lock is held for the whole turn: one child process
     // serves all threads and per-thread seq tracking requires ordered
     // access. The cache slot itself stays unlocked, so config updates and
     // bridge invalidation are never queued behind a streaming turn.
-    let mut bridge = bridge.lock().await;
+    let mut bridge = acquire_live_runtime_bridge(state).await?;
     let mut thread_map = state.runtime_thread_map.lock().await;
     if turn.max_output_tokens.is_some() {
         let info = bridge
@@ -1182,10 +1192,31 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
                 .map_err(|err| JsonRpcError::invalid_params(err.to_string()))?;
         }
     }
+    let minted = !thread_map.contains_key(turn.thread_key);
     let runtime_thread_id = bridge
         .ensure_runtime_thread(&mut thread_map, turn.thread_key, hint)
         .await
         .map_err(|err| JsonRpcError::runtime_unavailable(err.to_string()))?;
+    if minted && link_thread {
+        // Persist the link so the conversation survives an app-server
+        // restart. If it cannot be saved, undo the in-memory mapping too:
+        // a turn on a link that dies with this process would silently fork
+        // the conversation on the next restart.
+        let saved = state
+            .runtime
+            .read()
+            .await
+            .thread_manager
+            .state_store()
+            .set_runtime_thread_link(turn.thread_key, &runtime_thread_id);
+        if let Err(err) = saved {
+            bridge.forget_thread(&mut thread_map, turn.thread_key);
+            return Err(JsonRpcError::internal(format!(
+                "failed to save the runtime link for thread {}: {err}",
+                turn.thread_key
+            )));
+        }
+    }
     // The mapping is settled for this turn; drop the guard so a long stream
     // never holds the map hostage. `forget_thread` re-locks below.
     drop(thread_map);
@@ -1211,6 +1242,50 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
         bridge.forget_thread(&mut thread_map, turn.thread_key);
     }
     result.map_err(|err| JsonRpcError::internal(err.to_string()))
+}
+
+/// Restore `thread_key`'s durable runtime link into the in-memory map and
+/// report whether `thread_key` is a persisted thread (so a runtime thread
+/// minted for it can be linked).
+///
+/// The in-memory map dies with the process; without the durable link, a
+/// thread created before a daemon restart silently continued on a brand-new,
+/// empty runtime thread. With `require_known`, an id that is neither mapped,
+/// linked, nor persisted is `thread_not_found`.
+async fn restore_thread_link(
+    state: &AppState,
+    thread_key: &str,
+    require_known: bool,
+) -> std::result::Result<bool, JsonRpcError> {
+    let (persisted, link) = {
+        let runtime = state.runtime.read().await;
+        let store = runtime.thread_manager.state_store();
+        let persisted = store
+            .get_thread(thread_key)
+            .map_err(|err| JsonRpcError::internal(err.to_string()))?
+            .is_some();
+        let link = if persisted {
+            store
+                .get_runtime_thread_link(thread_key)
+                .map_err(|err| JsonRpcError::internal(err.to_string()))?
+        } else {
+            None
+        };
+        (persisted, link)
+    };
+    let mut thread_map = state.runtime_thread_map.lock().await;
+    if !thread_map.contains_key(thread_key) {
+        match link {
+            Some(runtime_thread_id) => {
+                thread_map.insert(thread_key.to_string(), runtime_thread_id);
+            }
+            None if require_known && !persisted => {
+                return Err(JsonRpcError::thread_not_found(thread_key));
+            }
+            None => {}
+        }
+    }
+    Ok(persisted)
 }
 
 /// Run a prompt as a genuine model turn and return what the model actually
@@ -1251,6 +1326,9 @@ async fn run_prompt_turn<W: AsyncWrite + Unpin>(
             // thread id is already interruptible through `thread/message`.
             interruptible: false,
             ephemeral,
+            // A caller-chosen `/prompt` thread key keeps its conversation
+            // but need not name a `thread/create` thread.
+            require_known_thread: false,
         },
         Some(&mut transcript),
     )
@@ -1310,6 +1388,7 @@ async fn run_http_thread_message(
             model_override: None,
             interruptible: false,
             ephemeral: false,
+            require_known_thread: true,
         },
         Some(&mut transcript),
     )
@@ -1349,6 +1428,7 @@ async fn handle_stdio_thread_message<W: AsyncWrite + Unpin>(
             model_override: None,
             interruptible: true,
             ephemeral: false,
+            require_known_thread: true,
         },
         None,
     )
@@ -1401,6 +1481,35 @@ async fn acquire_runtime_bridge(
     // Prefer a bridge cached by a concurrent caller while we were spawning;
     // dropping our unused one kills the extra child via `Drop`.
     Ok(slot.get_or_insert_with(|| bridge.clone()).clone())
+}
+
+/// Lock a cached bridge whose child is still running, respawning once when
+/// the cached child has exited (crash, OOM kill, external `kill`). Without
+/// this a dead child stayed cached and every later turn failed until the
+/// app-server itself restarted.
+async fn acquire_live_runtime_bridge(
+    state: &AppState,
+) -> std::result::Result<tokio::sync::OwnedMutexGuard<RuntimeBridge>, JsonRpcError> {
+    for _ in 0..2 {
+        let shared = acquire_runtime_bridge(state).await?;
+        let mut bridge = shared.clone().lock_owned().await;
+        if !bridge.child_exited() {
+            return Ok(bridge);
+        }
+        drop(bridge);
+        let mut slot = state.runtime_bridge.lock().await;
+        // Evict only the dead bridge: a concurrent caller may already have
+        // replaced it with a live one.
+        if slot
+            .as_ref()
+            .is_some_and(|cached| Arc::ptr_eq(cached, &shared))
+        {
+            *slot = None;
+        }
+    }
+    Err(JsonRpcError::runtime_unavailable(
+        "runtime API bridge exited immediately after starting",
+    ))
 }
 
 /// Ask the runtime to interrupt a turn that is streaming right now.
@@ -1958,6 +2067,14 @@ impl RuntimeBridge {
 }
 
 impl RuntimeBridge {
+    /// Whether the managed child has exited. A bridge without a child (tests,
+    /// or an externally managed runtime) never reports exited.
+    fn child_exited(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|child| !matches!(child.try_wait(), Ok(None)))
+    }
+
     /// Kills the managed runtime child and reaps it on a detached thread so
     /// neither an explicit shutdown nor Drop blocks a Tokio runtime thread.
     fn shutdown_child(&mut self) {
@@ -2463,13 +2580,6 @@ async fn process_app_request(
             }
         }
         AppRequest::ConfigSet { key, value } => {
-            let (result, snapshot) = {
-                let mut cfg = state.config.write().await;
-                let result = cfg.set_value(&key, &value);
-                (result, cfg.clone())
-            };
-            let ok = result.is_ok();
-            let message = result.err().map(|e| e.to_string());
             // Only propagate a mutation that actually happened. `set_value`
             // leaves the config untouched on an unknown key or invalid value,
             // so this is a no-op from the caller's point of view — but
@@ -2477,9 +2587,9 @@ async fn process_app_request(
             // regardless, and dropping the last reference kills the running
             // child runtime along with its thread map. A single typo'd key
             // would orphan every in-flight thread on that bridge.
-            if ok {
-                apply_config_update(state, snapshot, true).await;
-            }
+            let result = persist_config_mutation(state, |cfg| cfg.set_value(&key, &value)).await;
+            let ok = result.is_ok();
+            let message = result.err().map(|e| e.to_string());
             AppResponse {
                 ok,
                 data: json!({ "key": key, "value": value, "error": message }),
@@ -2487,18 +2597,11 @@ async fn process_app_request(
             }
         }
         AppRequest::ConfigUnset { key } => {
-            let (result, snapshot) = {
-                let mut cfg = state.config.write().await;
-                let result = cfg.unset_value(&key);
-                (result, cfg.clone())
-            };
-            let ok = result.is_ok();
-            let message = result.err().map(|e| e.to_string());
             // See ConfigSet: a failed unset changed nothing and must not tear
             // down the runtime bridge.
-            if ok {
-                apply_config_update(state, snapshot, true).await;
-            }
+            let result = persist_config_mutation(state, |cfg| cfg.unset_value(&key)).await;
+            let ok = result.is_ok();
+            let message = result.err().map(|e| e.to_string());
             AppResponse {
                 ok,
                 data: json!({ "key": key, "error": message }),
@@ -2537,7 +2640,7 @@ async fn process_app_request(
             // persist. External `permissions.toml` edits reach the Engine
             // because the update invalidates the runtime bridge; the next
             // turn's child loads both files fresh.
-            apply_config_update(state, store.config, false).await;
+            apply_config_update(state, store.config).await;
 
             AppResponse {
                 ok: true,
@@ -2605,24 +2708,14 @@ async fn process_app_request(
 }
 
 /// Propagate a new config snapshot to every place that must observe it:
-/// optionally persist it to disk, install it in the shared `state.config`,
-/// push it into the live [`Runtime`], and invalidate the cached stdio
-/// bridge so the next stdio request spawns a fresh child that reads the
-/// new on-disk config. The stdio→runtime thread map survives: runtime
-/// threads are durable, so the fresh child adopts the existing mappings
-/// rather than minting replacements (#6246). Shared by `ConfigSet` /
-/// `ConfigUnset` / `ConfigReload`.
-///
-/// `persist` is false on the reload path because disk is already the source
-/// of truth there.
-async fn apply_config_update(
-    state: &AppState,
-    snapshot: codewhale_config::ConfigToml,
-    persist: bool,
-) {
-    if persist && let Err(e) = persist_config(state, snapshot.clone()).await {
-        tracing::error!("Failed to persist config update: {e}");
-    }
+/// install it in the shared `state.config`, push it into the live
+/// [`Runtime`], and invalidate the cached stdio bridge so the next stdio
+/// request spawns a fresh child that reads the new on-disk config. The
+/// stdio→runtime thread map survives: runtime threads are durable, so the
+/// fresh child adopts the existing mappings rather than minting replacements
+/// (#6246). Shared by `ConfigSet` / `ConfigUnset` / `ConfigReload`; callers
+/// have already made disk agree with `snapshot`.
+async fn apply_config_update(state: &AppState, snapshot: codewhale_config::ConfigToml) {
     {
         let mut cfg = state.config.write().await;
         *cfg = snapshot.clone();
@@ -2634,13 +2727,30 @@ async fn apply_config_update(
     invalidate_runtime_bridge(state).await;
 }
 
-async fn persist_config(state: &AppState, config: codewhale_config::ConfigToml) -> Result<()> {
-    if state.config_path.is_none() {
-        return Ok(());
-    }
-    let mut store = ConfigStore::load(state.config_path.clone())?;
-    store.config = config;
-    store.save()
+/// Apply `mutate` to the config on disk, then propagate the saved result.
+///
+/// The mutation runs against a freshly loaded store, not the in-memory
+/// snapshot, so edits another process (TUI, `codewhale login`) saved since
+/// startup survive. With no explicit `--config` the store resolves the same
+/// default path the runtime child reads, so the change reaches turns and
+/// survives a restart. Any load, mutation, or save failure is returned and
+/// nothing is propagated, so the caller never reports `ok` for a change
+/// that was not kept.
+async fn persist_config_mutation(
+    state: &AppState,
+    mutate: impl FnOnce(&mut codewhale_config::ConfigToml) -> Result<()>,
+) -> Result<()> {
+    let snapshot = {
+        // Hold the write guard across load→mutate→save so two concurrent
+        // mutations cannot each save over the other's change.
+        let _serialize = state.config.write().await;
+        let mut store = ConfigStore::load(state.config_path.clone())?;
+        mutate(&mut store.config)?;
+        store.save()?;
+        store.config
+    };
+    apply_config_update(state, snapshot).await;
+    Ok(())
 }
 
 /// Install the process-wide rustls crypto provider once for tests that build
@@ -3115,7 +3225,7 @@ mod tests {
 
         // An unrelated config snapshot still rebuilds the bridge child.
         let snapshot = state.config.read().await.clone();
-        apply_config_update(&state, snapshot, false).await;
+        apply_config_update(&state, snapshot).await;
         assert!(
             state.runtime_bridge.lock().await.is_none(),
             "config update must drop the cached bridge",
@@ -3156,6 +3266,193 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn thread_message_on_an_unknown_thread_is_not_found() {
+        crate::install_test_crypto_provider();
+        // A typo'd or never-created id used to mint a fresh runtime thread
+        // and answer from an empty conversation.
+        let (base_url, fixture, server) = spawn_recording_runtime().await;
+        let (state, _tmp) = capability_test_state();
+        seed_bridge_at(&state, base_url).await;
+
+        let err = dispatch_stdio_request(
+            &state,
+            "thread/message",
+            json!({ "thread_id": "never-created", "input": "hello" }),
+        )
+        .await
+        .expect_err("an unknown thread must be refused");
+        assert_eq!(err.code, THREAD_NOT_FOUND_CODE);
+        let http_err = run_http_thread_message(
+            &state,
+            "never-created".to_string(),
+            "hello".to_string(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect_err("HTTP messages refuse unknown threads too");
+        assert_eq!(http_err.code, THREAD_NOT_FOUND_CODE);
+        assert_eq!(
+            fixture.created.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no runtime thread may be minted for an unknown id",
+        );
+        assert!(fixture.turn_threads.lock().await.is_empty());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn thread_runtime_link_survives_an_app_server_restart() {
+        crate::install_test_crypto_provider();
+        // The client→runtime thread map lived only in memory, so after a
+        // daemon restart `thread/message` on an existing thread silently
+        // continued on a brand-new, empty runtime thread.
+        let (base_url, fixture, server) = spawn_recording_runtime().await;
+        let (state, tmp) = capability_test_state();
+        seed_client_thread(&state, "client-1").await;
+        seed_bridge_at(&state, base_url.clone()).await;
+        dispatch_stdio_request(
+            &state,
+            "thread/message",
+            json!({ "thread_id": "client-1", "input": "first" }),
+        )
+        .await
+        .expect("first message");
+        drop(state);
+
+        // Same state directory, fresh process state.
+        let restarted =
+            build_state(Some(tmp.path().join("config.toml")), None).expect("restarted state");
+        assert!(restarted.runtime_thread_map.lock().await.is_empty());
+        seed_bridge_at(&restarted, base_url).await;
+        dispatch_stdio_request(
+            &restarted,
+            "thread/message",
+            json!({ "thread_id": "client-1", "input": "second" }),
+        )
+        .await
+        .expect("message after restart");
+
+        assert_eq!(
+            fixture.created.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the restarted server must reuse the linked runtime thread",
+        );
+        assert_eq!(
+            fixture.turn_threads.lock().await.as_slice(),
+            ["thr_minted".to_string(), "thr_minted".to_string()],
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dead_runtime_child_is_not_reused() {
+        crate::install_test_crypto_provider();
+        // A crashed or killed child stayed cached, so every later turn failed
+        // against it until the app-server restarted.
+        let (state, _tmp) = capability_test_state();
+        let mut dead_child = Command::new("true").spawn().expect("spawn fixture child");
+        dead_child.wait().expect("fixture child exits");
+        let mut dead = RuntimeBridge::from_base_url_for_test("http://127.0.0.1:9".to_string());
+        dead.child = Some(dead_child);
+        let dead = Arc::new(Mutex::new(dead));
+        *state.runtime_bridge.lock().await = Some(dead.clone());
+
+        // The respawn itself cannot succeed in-process (the test binary is
+        // not a runtime), so the call fails — but it must not hand back the
+        // dead bridge, and the dead bridge must leave the cache.
+        let result = acquire_live_runtime_bridge(&state).await;
+        assert!(
+            result.is_err(),
+            "the dead bridge must not be returned for a turn"
+        );
+        let slot = state.runtime_bridge.lock().await;
+        assert!(
+            !slot
+                .as_ref()
+                .is_some_and(|cached| Arc::ptr_eq(cached, &dead)),
+            "the dead bridge must be evicted from the cache",
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_keeps_edits_saved_by_other_processes() {
+        // Persisting used to write the startup snapshot back over a freshly
+        // loaded store, erasing edits another process (the TUI, `login`)
+        // had saved since.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "model = \"deepseek-chat\"\n").expect("write config");
+        let state = build_state(Some(config_path.clone()), None).expect("state");
+        fs::write(
+            &config_path,
+            "model = \"deepseek-chat\"\ntelemetry = true\n",
+        )
+        .expect("external edit");
+
+        let response = process_app_request(
+            &state,
+            AppRequest::ConfigSet {
+                key: "model".to_string(),
+                value: "deepseek-reasoner".to_string(),
+            },
+            AppTransport::Stdio,
+        )
+        .await;
+        assert!(response.ok, "set should succeed: {response:?}");
+        let persisted = fs::read_to_string(&config_path).expect("read config");
+        assert!(persisted.contains("deepseek-reasoner"), "{persisted}");
+        assert!(
+            persisted.contains("telemetry = true"),
+            "the external edit must survive: {persisted}"
+        );
+        assert_eq!(
+            state.config.read().await.telemetry,
+            Some(true),
+            "the live config reflects what was saved",
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_reports_a_failed_save() {
+        crate::install_test_crypto_provider();
+        // A save failure was logged and swallowed: the reply said ok while
+        // disk (and so every future turn) kept the old value.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "model = \"deepseek-chat\"\n").expect("write config");
+        let state = build_state(Some(config_path.clone()), None).expect("state");
+        *state.runtime_bridge.lock().await = Some(sentinel_bridge());
+        fs::write(&config_path, "model = [unterminated\n").expect("corrupt config");
+
+        let response = process_app_request(
+            &state,
+            AppRequest::ConfigSet {
+                key: "model".to_string(),
+                value: "deepseek-reasoner".to_string(),
+            },
+            AppTransport::Stdio,
+        )
+        .await;
+        assert!(!response.ok, "an unsaved change must not report ok");
+        assert!(response.data["error"].is_string());
+        assert_eq!(
+            state.config.read().await.model.as_deref(),
+            Some("deepseek-chat"),
+            "nothing is propagated when the save fails",
+        );
+        assert!(
+            state.runtime_bridge.lock().await.is_some(),
+            "a failed save must not tear down the bridge",
+        );
     }
 
     #[tokio::test]
@@ -3579,6 +3876,7 @@ mod tests {
     async fn interrupt_stops_a_turn_that_would_otherwise_stream_forever() {
         let (base_url, _notify, server) = spawn_uninterruptible_until_asked_runtime().await;
         let (state, _tmp) = capability_test_state();
+        seed_client_thread(&state, "thr_a").await;
         *state.runtime_bridge.lock().await = Some(Arc::new(Mutex::new(
             RuntimeBridge::from_base_url_for_test(base_url),
         )));
@@ -3773,6 +4071,9 @@ mod tests {
             );
         }
         assert_eq!(fixture.created.load(Ordering::SeqCst), 0);
+        for thread_id in ["stdio-cap", "request-cap", "http-cap"] {
+            seed_client_thread(&state, thread_id).await;
+        }
         for (method, params) in [
             (
                 "prompt/run",
@@ -4186,6 +4487,7 @@ mod tests {
     #[tokio::test]
     async fn http_thread_message_runs_the_turn_instead_of_queueing_it() {
         let (state, _tmp) = capability_test_state();
+        seed_client_thread(&state, "thr_http").await;
         let (base_url, prompts, server) = spawn_stub_runtime().await;
         seed_bridge_at(&state, base_url).await;
 
@@ -4218,6 +4520,7 @@ mod tests {
     #[tokio::test]
     async fn http_thread_message_without_a_runtime_is_a_typed_error() {
         let (state, _tmp) = capability_test_state();
+        seed_client_thread(&state, "thr_http").await;
         seed_bridge_at(&state, "http://127.0.0.1:9".to_string()).await;
 
         let err = run_http_thread_message(
@@ -4315,6 +4618,42 @@ mod tests {
         fs::write(&config_path, "").expect("write config");
         let state = build_state(Some(config_path), None).expect("state");
         (state, tmp)
+    }
+
+    /// Persist a client thread under a fixed id, as `thread/create` would,
+    /// so `thread/message` accepts it.
+    async fn seed_client_thread(state: &AppState, thread_id: &str) {
+        state
+            .runtime
+            .read()
+            .await
+            .thread_manager
+            .state_store()
+            .upsert_thread(&codewhale_state::ThreadMetadata {
+                id: thread_id.to_string(),
+                rollout_path: None,
+                preview: String::new(),
+                ephemeral: false,
+                model_provider: "deepseek".to_string(),
+                created_at: 1,
+                updated_at: 1,
+                status: codewhale_state::ThreadStatus::Idle,
+                path: None,
+                cwd: PathBuf::from("/tmp/codewhale"),
+                cli_version: "0.0.0-test".to_string(),
+                source: codewhale_state::SessionSource::Api,
+                name: None,
+                sandbox_policy: None,
+                approval_mode: None,
+                archived: false,
+                archived_at: None,
+                git_sha: None,
+                git_branch: None,
+                git_origin_url: None,
+                memory_mode: None,
+                current_leaf_id: None,
+            })
+            .expect("seed client thread");
     }
 
     #[tokio::test]

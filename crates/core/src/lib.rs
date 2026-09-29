@@ -626,10 +626,14 @@ impl ThreadManager {
         let mut thread = to_protocol_thread(metadata);
         thread.status = ThreadStatus::Running;
         thread.updated_at = chrono::Utc::now().timestamp();
-        thread.cwd = params
-            .cwd
-            .clone()
-            .unwrap_or_else(|| fallback_cwd.to_path_buf());
+        // The persisted row already carries the thread's workspace. Only an
+        // explicit `cwd` may move it; the fallback (the server's own process
+        // cwd) applies solely to a row that never recorded one.
+        if let Some(cwd) = params.cwd.clone() {
+            thread.cwd = cwd;
+        } else if thread.cwd.as_os_str().is_empty() {
+            thread.cwd = fallback_cwd.to_path_buf();
+        }
         self.persist_thread(&thread, None)?;
         self.running_threads
             .insert(thread.id.clone(), thread.clone());
@@ -855,9 +859,9 @@ impl ThreadManager {
     }
 
     fn persist_thread(&self, thread: &Thread, rollout_path: Option<PathBuf>) -> Result<()> {
-        // This update payload carries no per-thread policy, so preserve any
-        // policy already stored for the thread rather than erasing it with
-        // NULLs on every persist/resume.
+        // This update payload carries no per-thread policy or git/memory
+        // context, so preserve whatever is already stored for the thread
+        // rather than erasing it with NULLs on every persist/resume.
         let existing = self.store.get_thread(&thread.id)?;
         self.store.upsert_thread(&ThreadMetadata {
             id: thread.id.clone(),
@@ -881,10 +885,18 @@ impl ThreadManager {
                 .and_then(|metadata| metadata.approval_mode.clone()),
             archived: matches!(thread.status, ThreadStatus::Archived),
             archived_at: None,
-            git_sha: None,
-            git_branch: None,
-            git_origin_url: None,
-            memory_mode: None,
+            git_sha: existing
+                .as_ref()
+                .and_then(|metadata| metadata.git_sha.clone()),
+            git_branch: existing
+                .as_ref()
+                .and_then(|metadata| metadata.git_branch.clone()),
+            git_origin_url: existing
+                .as_ref()
+                .and_then(|metadata| metadata.git_origin_url.clone()),
+            memory_mode: existing
+                .as_ref()
+                .and_then(|metadata| metadata.memory_mode.clone()),
             current_leaf_id: None,
         })
     }
@@ -2446,6 +2458,67 @@ mod tests {
             .expect("thread persisted");
         assert_eq!(persisted.sandbox_policy.as_deref(), Some("workspace-write"));
         assert_eq!(persisted.approval_mode.as_deref(), Some("on-request"));
+    }
+
+    #[test]
+    fn resume_without_cwd_keeps_the_persisted_workspace() {
+        // A fresh manager (daemon restart) resumes through the persisted
+        // path. Without an explicit `cwd`, the server's own process cwd used
+        // to overwrite the thread's workspace, and resumed turns then ran
+        // in the wrong directory.
+        let store = temp_core_state("resume-cwd");
+        let mut metadata = test_thread_metadata("thread-cwd");
+        metadata.cwd = PathBuf::from("/work/project");
+        metadata.git_branch = Some("feature".to_string());
+        metadata.memory_mode = Some("enabled".to_string());
+        store.upsert_thread(&metadata).expect("seed thread");
+
+        let mut manager = ThreadManager::new(store);
+        let mut resume_params = ThreadResumeParams {
+            thread_id: "thread-cwd".to_string(),
+            history: None,
+            path: None,
+            model: None,
+            model_provider: None,
+            cwd: None,
+            approval_policy: None,
+            sandbox: None,
+            config: None,
+            base_instructions: None,
+            developer_instructions: None,
+            personality: None,
+            persist_extended_history: false,
+        };
+        let resumed = manager
+            .resume_thread_with_history(
+                &resume_params,
+                Path::new("/daemon/process/cwd"),
+                "deepseek".to_string(),
+            )
+            .expect("resume thread")
+            .expect("thread found");
+        assert_eq!(resumed.cwd, PathBuf::from("/work/project"));
+        let persisted = manager
+            .state_store()
+            .get_thread("thread-cwd")
+            .expect("read thread")
+            .expect("thread persisted");
+        assert_eq!(persisted.cwd, PathBuf::from("/work/project"));
+        assert_eq!(persisted.git_branch.as_deref(), Some("feature"));
+        assert_eq!(persisted.memory_mode.as_deref(), Some("enabled"));
+
+        // An explicit cwd still moves the thread.
+        let mut manager = ThreadManager::new(manager.state_store().clone());
+        resume_params.cwd = Some(PathBuf::from("/work/other"));
+        let moved = manager
+            .resume_thread_with_history(
+                &resume_params,
+                Path::new("/daemon/process/cwd"),
+                "deepseek".to_string(),
+            )
+            .expect("resume thread")
+            .expect("thread found");
+        assert_eq!(moved.cwd, PathBuf::from("/work/other"));
     }
 
     #[tokio::test]

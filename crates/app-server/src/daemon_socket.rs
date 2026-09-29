@@ -439,6 +439,7 @@ mod platform {
                 tokio::select! {
                     accepted = listener.accept() => match accepted {
                         Ok((stream, _)) => {
+                            reap_finished_connections(&mut connections);
                             connections.spawn(handle_connection(context.clone(), stream));
                         }
                         Err(err) => {
@@ -459,6 +460,20 @@ mod platform {
             // still needs.
             connections.shutdown().await;
             Ok(())
+        }
+    }
+
+    /// Drop the tasks of connections that already ended. A `JoinSet` keeps
+    /// every finished task until it is joined, so without this a long-lived
+    /// daemon retained one task per past client (health polls, re-attaches)
+    /// for its whole lifetime. A panicked connection is logged, not fatal.
+    fn reap_finished_connections(connections: &mut JoinSet<()>) {
+        while let Some(joined) = connections.try_join_next() {
+            if let Err(err) = joined
+                && err.is_panic()
+            {
+                tracing::warn!(error = %err, "daemon connection task panicked");
+            }
         }
     }
 
@@ -740,6 +755,31 @@ mod platform {
                 version: None,
                 pid: None,
             }
+        }
+
+        #[tokio::test]
+        async fn finished_connection_tasks_are_reaped() {
+            let mut connections = JoinSet::new();
+            for _ in 0..3 {
+                connections.spawn(async {});
+            }
+            connections.spawn(async { panic!("fixture connection panic") });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    reap_finished_connections(&mut connections);
+                    if connections.is_empty() {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("finished connection tasks must leave the set");
+
+            let live = connections.spawn(std::future::pending::<()>());
+            reap_finished_connections(&mut connections);
+            assert_eq!(connections.len(), 1, "a live connection is kept");
+            live.abort();
         }
 
         #[test]
