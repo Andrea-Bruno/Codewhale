@@ -690,15 +690,20 @@ impl ThreadManager {
             return Ok(None);
         };
         let parent_thread = to_protocol_thread(parent);
+        // Like resume, a fork without an explicit `cwd` stays in the parent's
+        // recorded workspace; the server's own process cwd is only the
+        // fallback for a parent that never recorded one.
+        let cwd = match params.cwd.clone() {
+            Some(cwd) => cwd,
+            None if !parent_thread.cwd.as_os_str().is_empty() => parent_thread.cwd.clone(),
+            None => fallback_cwd.to_path_buf(),
+        };
         let new = self.spawn_thread_with_history(
             params
                 .model_provider
                 .clone()
                 .unwrap_or_else(|| parent_thread.model_provider.clone()),
-            params
-                .cwd
-                .clone()
-                .unwrap_or_else(|| fallback_cwd.to_path_buf()),
+            cwd,
             InitialHistory::Forked(vec![json!({
                 "type": "fork",
                 "from_thread_id": parent_thread.id
@@ -2518,6 +2523,43 @@ mod tests {
             )
             .expect("resume thread")
             .expect("thread found");
+        assert_eq!(moved.cwd, PathBuf::from("/work/other"));
+    }
+
+    #[test]
+    fn fork_without_cwd_stays_in_the_parent_workspace() {
+        // A fork without an explicit `cwd` used to start in the server's own
+        // process cwd instead of the parent thread's workspace.
+        let store = temp_core_state("fork-cwd");
+        let mut parent = test_thread_metadata("thread-parent");
+        parent.cwd = PathBuf::from("/work/project");
+        store.upsert_thread(&parent).expect("seed parent");
+        let mut manager = ThreadManager::new(store);
+        let mut fork_params = ThreadForkParams {
+            thread_id: "thread-parent".to_string(),
+            path: None,
+            model: None,
+            model_provider: None,
+            cwd: None,
+            approval_policy: None,
+            sandbox: None,
+            config: None,
+            base_instructions: None,
+            developer_instructions: None,
+            persist_extended_history: false,
+        };
+        let forked = manager
+            .fork_thread(&fork_params, Path::new("/daemon/process/cwd"))
+            .expect("fork thread")
+            .expect("parent found");
+        assert_eq!(forked.cwd, PathBuf::from("/work/project"));
+        assert_eq!(forked.thread.cwd, PathBuf::from("/work/project"));
+
+        fork_params.cwd = Some(PathBuf::from("/work/other"));
+        let moved = manager
+            .fork_thread(&fork_params, Path::new("/daemon/process/cwd"))
+            .expect("fork thread")
+            .expect("parent found");
         assert_eq!(moved.cwd, PathBuf::from("/work/other"));
     }
 
