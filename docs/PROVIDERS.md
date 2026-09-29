@@ -56,7 +56,7 @@ for an unknown model, so set it on the route after saving:
 
 Cheaper Inference is an OpenAI-compatible gateway with one key for models from
 several labs. Model ids are bare, such as `gpt-5.4-mini` or `claude-sonnet-5`.
-Each model costs 15–60% less than the list price of its lab.
+Pricing varies by model and route; consult the provider’s current catalog.
 The authority is `GET https://api.cheaperinference.com/v1/models` with your key.
 Docs: <https://cheaperinference.com/docs>.
 
