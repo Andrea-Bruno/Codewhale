@@ -22003,7 +22003,8 @@ async fn decision_receipt_lease_persists_terminal_turn_and_replays_exactly_once(
         );
     }
     drop(lease);
-    let reloaded = test_manager(directory)?.store.load_turn(&turn.id)?;
+    let restarted = test_manager(directory)?;
+    let reloaded = restarted.store.load_turn(&turn.id)?;
     assert_eq!(reloaded.status, RuntimeTurnStatus::Completed);
     assert_eq!(reloaded.decision_receipts, vec![receipt.sanitized()]);
     assert_eq!(
@@ -22012,6 +22013,17 @@ async fn decision_receipt_lease_persists_terminal_turn_and_replays_exactly_once(
             .provider_reported_cost_usd
             .as_deref(),
         Some("0.000012054")
+    );
+    let aggregate = restarted
+        .aggregate_usage(None, None, UsageGroupBy::Thread)
+        .await?;
+    assert!(
+        aggregate
+            .totals
+            .route_receipts
+            .iter()
+            .any(|r| r.contains("0.000012054")),
+        "existing cost diagnostics expose retained provider evidence"
     );
     assert!(
         reloaded.routed_usage.is_empty(),

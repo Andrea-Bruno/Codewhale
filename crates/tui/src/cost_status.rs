@@ -3493,6 +3493,53 @@ mod tests {
         assert_eq!(malformed.dropped_records, 1);
     }
 
+    #[test]
+    fn decision_receipts_metadata_round_trip_is_bounded_and_legacy_compatible() {
+        let receipt = decision_receipt_fixture("raw-child-decision-id");
+        let mut metadata = serde_json::json!({});
+        attach_child_usage_batch_metadata(
+            &mut metadata,
+            &RuntimeUsageBatch {
+                decisions: vec![receipt.clone()],
+                ..Default::default()
+            },
+        );
+        assert!(!metadata.to_string().contains("raw-child-decision-id"));
+        let decoded = child_usage_records_from_metadata(&metadata).expect("batch");
+        assert_eq!(decoded.decisions, vec![receipt.sanitized()]);
+        assert_eq!(decoded.dropped_records, 0);
+        metadata[CHILD_DECISION_RECEIPTS_KEY][0]["evidence"]["response_model"] =
+            serde_json::json!("x".repeat(129));
+        let invalid = child_usage_records_from_metadata(&metadata).expect("batch");
+        assert!(invalid.decisions.is_empty());
+        assert_eq!(invalid.dropped_records, 1);
+        metadata
+            .as_object_mut()
+            .expect("metadata")
+            .remove(CHILD_DECISION_RECEIPTS_KEY);
+        assert!(
+            child_usage_records_from_metadata(&metadata)
+                .expect("old batch")
+                .decisions
+                .is_empty()
+        );
+        let mut oversized = receipt;
+        oversized.evidence.response_model = Some("x".repeat(129));
+        attach_child_usage_batch_metadata(
+            &mut metadata,
+            &RuntimeUsageBatch {
+                decisions: vec![oversized],
+                ..Default::default()
+            },
+        );
+        let invalid = child_usage_records_from_metadata(&metadata).expect("bounded batch");
+        assert!(invalid.decisions.is_empty());
+        assert_eq!(
+            invalid.dropped_records, 1,
+            "discarded evidence must leave an explicit coverage gap"
+        );
+    }
+
     fn deepseek() -> BackgroundRoute<'static> {
         BackgroundRoute::new(ApiProvider::Deepseek, "deepseek-v4-flash")
             .with_base_url(Some(crate::config::DEFAULT_DEEPSEEK_BASE_URL))

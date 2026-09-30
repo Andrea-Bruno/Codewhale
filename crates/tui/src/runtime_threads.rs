@@ -9471,6 +9471,11 @@ impl RuntimeThreadManager {
                         &thread,
                     );
                 }
+                for receipt in &turn.decision_receipts {
+                    if usage_timestamp_in_range(receipt.route.dispatched_at, since, until) {
+                        totals.route_receipts.insert(receipt.diagnostic_receipt());
+                    }
+                }
                 for child in &turn.routed_usage {
                     if usage_timestamp_in_range(child.route.dispatched_at, since, until) {
                         accumulate_runtime_child_usage_record(
@@ -12665,6 +12670,7 @@ impl RuntimeThreadManager {
             .clone()
             .unwrap_or_else(|| summarize_text(&prompt, SUMMARY_LIMIT));
         let mut turn = TurnRecord {
+            decision_receipts: Vec::new(),
             max_output_tokens,
             schema_version: if max_output_tokens.is_some() { OUTPUT_LIMIT_RUNTIME_SCHEMA_VERSION } else { CURRENT_RUNTIME_SCHEMA_VERSION },
             id: turn_id.clone(),

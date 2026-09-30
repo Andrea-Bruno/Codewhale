@@ -285,7 +285,6 @@ impl CodewhaleClient {
         } else {
             api_url(&isolated.base_url, "systemone")
         };
-        isolated.wait_for_rate_limit().await;
         dispatched.store(true, std::sync::atomic::Ordering::Release);
         let response = isolated
             .send_json_with_retry(&url, body)
@@ -517,5 +516,87 @@ mod decisions_compatibility_tests {
         ] {
             assert!(!valid_decision_request(&shape));
         }
+    }
+    #[tokio::test]
+    async fn decision_transport_preserves_typesafe_auth_and_shared_admission_before_dispatch() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(header("authorization", "Bearer decision-fixture-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let _key =
+            crate::test_support::EnvVarGuard::set(TYPESAFE_API_KEY_ENV, "decision-fixture-key");
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                deepseek: crate::config::ProviderConfig {
+                    api_key: Some("chat-fixture-key".into()),
+                    max_concurrency: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let base = format!("{}/v1", server.uri());
+        let ticket = crate::test_support::env_scope_ticket();
+        let client = tokio::task::spawn_blocking(move || {
+            let _membership = crate::test_support::join_env_scope(ticket);
+            CodewhaleClient::for_decision_route(&config, DecisionRouterRoute::Typesafe, Some(&base))
+        })
+        .await
+        .expect("worker")
+        .expect("client");
+        assert_eq!(client.provider_request_concurrency_limit(), Some(1));
+        assert!(
+            client.remote_control_inference_participant,
+            "the cloned budget must remain an attached inference participant"
+        );
+        let clone = client.clone();
+        let held = client
+            .acquire_provider_request_permit()
+            .await
+            .expect("shared permit");
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                clone.system_one_decide(&request(), &dispatched)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            !dispatched.load(std::sync::atomic::Ordering::Acquire),
+            "a queued request has no dispatched-spend marker"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+        drop(held);
+        let answer = client
+            .system_one_decide(&request(), &dispatched)
+            .await
+            .expect("one admitted request");
+        assert!(dispatched.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(answer.answers_validated, Some(true));
+        assert_eq!(
+            client
+                .effective_route_envelope("jev-latest", chrono::Utc::now())
+                .provider_identity,
+            "typesafe"
+        );
     }
 }
