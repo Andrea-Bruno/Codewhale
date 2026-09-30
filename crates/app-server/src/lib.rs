@@ -4033,8 +4033,12 @@ mod tests {
         })
         .await;
         drop(reader);
-        assert!(set.await.unwrap().ok);
-        assert!(reload.await.ok);
+        let (set, reload) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(set, reload) })
+                .await
+                .expect("both queued operations finish");
+        assert!(set.unwrap().ok);
+        assert!(reload.ok);
         assert_eq!(
             state.config.read().await.model.as_deref(),
             Some("deepseek-reasoner")
