@@ -774,6 +774,39 @@ min_confidence = 0.5          # default 0.5, clamped to 0..1
 - `thinking` is ignored for decision routers. OpenRouter spend is recorded like
   any routed usage; TypeSafe-direct spend appears on the receipt only.
 
+#### Shadow Decision Gate (experimental, off by default)
+
+The Superfast Decision Gate asks a decision model three typed questions about
+the latest user message — does it need a tool, can it be answered from the
+conversation, and what is its intent — and logs a conservative recommendation.
+It is shadow-only: it never changes routing, never skips or delays the model
+call, and fails open on any error, timeout or malformed answer. It uses the same
+System One client as the decision router above; there is no separate HTTP
+client. It is configured from the environment and reads it when a turn starts:
+
+```sh
+SUPERFAST_ENABLED=1              # off unless set
+SUPERFAST_PROVIDER=typesafe      # or openrouter; required when enabled
+SUPERFAST_BASE_URL=http://localhost:8000/v1  # optional TypeSafe-route base, e.g. self-hosted
+SUPERFAST_MODEL=jev-latest       # default jev-latest / ~typesafe/jev-latest
+SUPERFAST_TIMEOUT_MS=150         # 1..=10000, default 150
+```
+
+- Enabling the gate never picks an endpoint by itself: without
+  `SUPERFAST_PROVIDER` nothing is sent and a warning is logged.
+- The key comes from the same place the decision router reads it. The TypeSafe
+  route always authenticates, so a self-hosted server that ignores auth still
+  needs a placeholder `TYPESAFE_API_KEY`.
+- Only the latest user message is sent, truncated to 4,000 characters and
+  redacted of configured secrets. The log (target `superfast`) carries the
+  route, failure class and latency, never prompt text.
+- The gate's own spend is the configured endpoint's; it is not added to session
+  cost totals or Auto receipts.
+
+The Decision Gate concept and reference implementation are by Andrea Bruno,
+released under CC BY 4.0:
+[harness-superfast](https://github.com/Andrea-Bruno/harness-superfast).
+
 Two `[auto]` keys shape routing (`AutoConfig` in `crates/tui/src/config.rs`):
 
 ```toml
