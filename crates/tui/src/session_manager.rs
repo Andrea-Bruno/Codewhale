@@ -1922,13 +1922,13 @@ impl SessionManager {
             }
         };
         for record in ledger.records {
-            if let Some(receipt) = &record.decision {
-                if receipt.is_bounded() {
-                    metadata
-                        .cost
-                        .route_receipts
-                        .insert(receipt.diagnostic_receipt());
-                }
+            if let Some(receipt) = &record.decision
+                && receipt.is_bounded()
+            {
+                metadata
+                    .cost
+                    .route_receipts
+                    .insert(receipt.diagnostic_receipt());
             }
             let source_fingerprint = record.source_fingerprint.clone();
             let source_id = format!("late:{}", record.source_fingerprint);
