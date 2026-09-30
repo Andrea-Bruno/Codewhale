@@ -626,9 +626,12 @@ pub enum ContextMenuAction {
     OpenCommandPalette,
     OpenContextInspector,
     OpenHelp,
-    /// Open the selected file:line in the user's editor.
+    /// Open a workspace file at a line in the user's editor. The path was
+    /// resolved inside the workspace when the menu was built; the entry is
+    /// only offered when it resolved.
     OpenFileAtLine {
-        cell_index: usize,
+        path: std::path::PathBuf,
+        line: u32,
     },
     /// Hide a transcript cell. Adds the cell's index to `collapsed_cells`.
     HideCell {
@@ -640,18 +643,35 @@ pub enum ContextMenuAction {
     },
     /// Show all currently hidden cells.
     ShowAllHidden,
-    /// Execute a slash command associated with a contextual UI row.
-    ExecuteCommand {
-        command: String,
-    },
+    /// Run a work-surface row action — the same typed action a left click or
+    /// Enter on that row runs, never a free-form command string.
+    Row(crate::tui::app::SidebarRowAction),
     /// Copy a pre-resolved text payload (e.g. a sidebar row's full text)
     /// to the clipboard.
     CopyText {
         text: String,
     },
+    /// Act on a row of the open Extensions panel, found again by its id.
+    Extension {
+        item_id: String,
+        verb: ExtensionMenuVerb,
+    },
     /// Pin/unpin the host terminal window (normal window ↔ always-on-top
     /// mini window). Windows only; no-op elsewhere.
     ToggleWindowPin,
+}
+
+/// What an Extensions row menu entry does to its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionMenuVerb {
+    /// The row's own action — what Enter runs.
+    Activate,
+    /// Show the row's state, description and detail in a pager.
+    Details,
+    /// The row's reversible on/off switch.
+    Toggle,
+    /// Remove the row. The menu already asked for confirmation.
+    Remove,
 }
 
 #[derive(Debug, Clone)]
@@ -1087,6 +1107,14 @@ pub enum ViewEvent {
     ContextMenuSelected {
         action: ContextMenuAction,
     },
+    /// A modal view asks for a context menu over itself (the Extensions
+    /// panel's row menu). The host pushes it on top of the view.
+    OpenContextMenu {
+        title: String,
+        entries: Vec<crate::tui::context_menu::ContextMenuEntry>,
+        column: u16,
+        row: u16,
+    },
     /// Emitted by the pager (`c` / `y`) to copy its body to the system
     /// clipboard. The host handler writes via `app.clipboard` and surfaces a
     /// status message — modal views cannot reach `app` directly. `label` is
@@ -1196,7 +1224,7 @@ pub struct ViewStack {
     /// When the view now on top became the top view — pushed, or revealed
     /// by closing or removing the views above it. A key observed before
     /// this instant was typed at something else and must never answer an
-    /// approval card that only then became visible (approvals M2).
+    /// approval or elevation card that only then became visible (approvals M2).
     top_since: Option<std::time::Instant>,
 }
 
@@ -1287,14 +1315,16 @@ impl ViewStack {
     }
 
     /// Whether a key observed at `observed_at` predates the moment the
-    /// approval card on top became visible — raised, or revealed by closing
-    /// the card above it — i.e. it was typed ahead and must not answer that
-    /// card. Two quick `y` presses answer one card, never the one beneath.
+    /// approval or elevation card on top became visible — raised, or revealed
+    /// by closing the card above it — i.e. it was typed ahead and must not
+    /// answer that card. Two quick answers cannot confirm the card beneath.
     pub fn key_predates_top_approval(&self, observed_at: std::time::Instant) -> bool {
-        self.top_approval_id().is_some()
-            && self
-                .top_since
-                .is_some_and(|top_since| observed_at < top_since)
+        matches!(
+            self.top_kind(),
+            Some(ModalKind::Approval | ModalKind::Elevation)
+        ) && self
+            .top_since
+            .is_some_and(|top_since| observed_at < top_since)
     }
 
     pub fn contains_kind(&self, kind: ModalKind) -> bool {
@@ -1461,6 +1491,32 @@ impl ViewStack {
         self.views
             .last()
             .is_some_and(|view| view.kind() == ModalKind::Extensions)
+    }
+
+    /// Run an Extensions row-menu entry against the panel, when it is on
+    /// top. `None` when the panel is gone or no longer lists the row.
+    pub fn extensions_menu_action(
+        &mut self,
+        item_id: &str,
+        verb: ExtensionMenuVerb,
+    ) -> Option<Vec<ViewEvent>> {
+        let action = self
+            .views
+            .last_mut()?
+            .as_any_mut()
+            .downcast_mut::<extensions::ExtensionsView>()?
+            .run_menu_verb(item_id, verb)?;
+        Some(self.apply_action(action))
+    }
+
+    /// Whether a provider picker anywhere in the stack has been used — a key
+    /// pressed or a click landed in it.
+    pub fn provider_picker_interacted(&mut self) -> bool {
+        self.views.iter_mut().any(|view| {
+            view.as_any_mut()
+                .downcast_mut::<crate::tui::provider_picker::ProviderPickerView>()
+                .is_some_and(|picker| picker.interacted())
+        })
     }
 
     /// Hand a freshly-built read model to the open Extensions panel, when it
@@ -5736,8 +5792,15 @@ pub(crate) fn subagent_view_agents(
     for agent in &mut agents[..manager_agent_count] {
         // The row headline reads `nickname`, so the dispatch name lands there
         // when the agent has one; the generated whale names the rest (#5287).
-        let display_name = crate::tui::sidebar::dispatched_agent_name(agent)
-            .map(str::to_string)
+        // The view is handed manager rows that may not be in
+        // `subagent_cache` yet, so the row's own dispatch name backs up the
+        // app-wide lookup.
+        let own_name = agent.name.trim();
+        let display_name = app
+            .agent_given_name(&agent.agent_id)
+            .or_else(|| {
+                (!own_name.is_empty() && own_name != agent.agent_id).then(|| own_name.to_string())
+            })
             .or_else(|| display_names.remove(&agent.agent_id));
         agent.nickname = display_name;
     }
@@ -5799,6 +5862,8 @@ fn live_subagent_result(
         duration_ms: 0,
         started_at: None,
         from_prior_session: false,
+        idle_ms: None,
+        heartbeat_timeout_ms: None,
     }
 }
 
@@ -7321,6 +7386,8 @@ mod tests {
             duration_ms: 10,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 
@@ -8553,6 +8620,60 @@ base_url = "https://api.xiaomimimo.com/v1"
             crate::tui::golden_harness::assert_matches_golden(
                 &format!("config_panel_{width}x{height}"),
                 &rendered,
+            );
+        }
+    }
+
+    /// ASCII-safe terminals: every settings row kind (toggle, choice, number,
+    /// text, action, read-only) and the panel chrome around it must narrow
+    /// to ASCII through the backend's cell adapter. `✎` used to pass through
+    /// untouched on every editable number/text row.
+    #[test]
+    fn config_panel_every_row_kind_renders_ascii_through_the_adapter() {
+        let _guard = ConfigSettingsEnvGuard::new("theme = \"terminal\"\n");
+        let app = create_test_app();
+        let mut view = ConfigView::new_for_app(&app);
+        let mut kinds_seen = Vec::new();
+        for category in ConfigCategory::ALL {
+            view.category = category;
+            view.select_first_visible_row();
+            let items = view.visible_items();
+            for item in &items {
+                if let ConfigListItem::Row(idx) = item {
+                    let kind = view.editor_kind(&view.rows[*idx]);
+                    if !kinds_seen.contains(&kind) {
+                        kinds_seen.push(kind);
+                    }
+                }
+            }
+            // Tall enough that the whole category paints without scrolling.
+            let height = u16::try_from(items.len() + 16).unwrap_or(u16::MAX);
+            let area = Rect::new(0, 0, 120, height);
+            let mut buf = Buffer::empty(area);
+            view.render(area, &mut buf);
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    let mut cell = buf[(x, y)].clone();
+                    crate::tui::color_compat::adapt_cell_symbol_for_ascii(&mut cell);
+                    assert!(
+                        cell.symbol().is_ascii(),
+                        "{category:?} ({x},{y}): {:?} has no ASCII fallback",
+                        buf[(x, y)].symbol()
+                    );
+                }
+            }
+        }
+        for kind in [
+            SettingKind::Boolean,
+            SettingKind::Choice,
+            SettingKind::Integer,
+            SettingKind::Text,
+            SettingKind::Action,
+            SettingKind::ReadOnly,
+        ] {
+            assert!(
+                kinds_seen.contains(&kind),
+                "no settings row of kind {kind:?} was rendered"
             );
         }
     }

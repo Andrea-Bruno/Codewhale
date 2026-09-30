@@ -2,7 +2,7 @@
 
 > 本文基于英文修订 `66816e6cc`（2026-08-16）的翻译。2026-09-13 仅核对并更新了角色名称、Workflow/Fleet 关系、生命周期和调用控制（状态、跟进、作用域与预算）；其余内容未全面重新同步。当前英文说明见 [SUBAGENTS.md](../SUBAGENTS.md)。
 
-Fleet 管理同一批子代理的保存模型和角色分配。单项委派使用 `agent`；包含阶段、依赖和完成检查的多项工作使用原生 `workflow` 的 `plan`。先用 `agent(action="roster")` 查看已保存且可用的 Fleet 模型与角色：计划中的子任务可用 `model` 指定候选列表中的 `provider/model`，或用 `role` / `profile` 选择保存的分配。命名的 Exact Fleet 固定成员路由，拒绝任务级模型覆盖。它们都通过现有 worker 运行时执行；参见 [Workflow 编写指南](../WORKFLOW_AUTHORING.md)。
+Fleet 管理同一批子代理的保存模型和角色分配。单项委派使用 `agent`；包含阶段、依赖和完成检查的多项工作使用原生 `workflow` 的 `plan`。先用 `agent(action="roster")` 查看已保存且可用的 Fleet 模型与角色：计划中的子任务可用 `model` 指定候选列表中的 `provider/model`，或用 `role` / `profile` 选择保存的分配。命名的 Exact Fleet 固定成员路由，拒绝任务级模型覆盖。它们都通过现有 worker 运行时执行；参见 [Workflow 编写指南](./WORKFLOW_AUTHORING.md)。
 
 Fleet 的八个规范角色名是 `general`、`explore`、`planner`、`reviewer`、`implement`、`test`、`advisor` 和 `custom`。父代理通过 `agent` 启动任务，默认收到包含 `agent_id`、声明的交付文件和有效限制的紧凑回执；需要转录句柄或账本时，按 ID 请求详情。内部运行时类型仍为 `FleetRole`（以前叫 `SubAgentType`）。`worker`、`scout`、`builder`、`verifier`、`consultant` 等旧拼写仅在解析或反序列化边界兼容接受；新的提示、配置和回执使用规范名。
 
@@ -73,7 +73,7 @@ Fleet 的八个规范角色名是 `general`、`explore`、`planner`、`reviewer`
 
 - `worktree_branch`：要创建的确切分支。
 - `worktree_base`：要从中开分支的 git ref；默认为 `HEAD`。
-- `worktree_path`：确切的检出路径。相对路径留在默认的兄弟目录 `.codewhale-worktrees/` 根下。
+- `worktree_path`：确切的检出路径。相对路径和绝对路径都必须留在默认的兄弟目录 `.codewhale-worktrees/<repo>/` 根下（检查前会解析符号链接）。任何 worktree 请求都保留审批卡片，即使是只读角色。
 
 `cwd` 可与 `worktree` 组合：所请求的目录成为仓库根（及新检出）解析所用的发现锚点（`prepare_child_workspace`）。没有 `worktree` 时，`cwd` 仍是针对父工作区内已经存在的目录的手动逃生舱。
 

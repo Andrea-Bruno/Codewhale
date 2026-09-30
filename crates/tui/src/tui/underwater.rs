@@ -637,7 +637,11 @@ impl ShellPhase {
         {
             return Self::Failed;
         }
+        // A child agent's unanswered approval or question is the person's
+        // move, even while other agents keep working: the footer says
+        // "waiting on you", not "agents underway" (#6565).
         if app.pending_user_input_prompt.is_some()
+            || !app.pending_child_requests.is_empty()
             || app
                 .task_panel
                 .iter()
@@ -2697,6 +2701,32 @@ mod launch_card_tests {
         let mut app = app_with_recent(&["one"], 9);
         crate::tui::ui::type_launch_mcp_remedy(&mut app);
         assert!(app.input.is_empty());
+    }
+
+    /// The migration notice ends with the reassurance that nothing applies
+    /// unapproved; a truncated notice drops exactly that half. The English
+    /// line must fit the card measure whole at a wide terminal.
+    #[test]
+    fn claude_notice_is_never_truncated_on_a_wide_terminal() {
+        let notice = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::LaunchNoticeClaude,
+        );
+        assert!(
+            text_display_width(&notice) <= LAUNCH_CARD_MEASURE,
+            "notice is {} cells; the card lane is {LAUNCH_CARD_MEASURE}: {notice:?}",
+            text_display_width(&notice),
+        );
+        let mut app = app_with_recent(&["one"], 1);
+        app.launch.claude_code_detected = true;
+        let state = launch_empty_state(&app, Rect::new(0, 0, 160, 40));
+        assert!(
+            state
+                .lines
+                .iter()
+                .any(|line| flatten(line).contains(notice.as_ref())),
+            "the full notice must paint at 160 columns",
+        );
     }
 
     #[test]

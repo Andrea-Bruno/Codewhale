@@ -320,12 +320,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             ));
             if let Some(queued) = queued.as_deref() {
                 // Truthful `· N queued`: follow-ups the running child has not
-                // yet folded into its next round. Accent so it reads as live
-                // pending work, not as part of the receipt.
+                // yet folded into its next round. Amber: a message is waiting
+                // on a busy agent, the one thing on this row that needs you.
                 spans.push(Span::styled(
                     queued.to_string(),
                     Style::default()
-                        .fg(app.ui_theme.accent_action)
+                        .fg(app.ui_theme.warning)
                         .bg(normal.bg.unwrap_or(app.ui_theme.panel_bg)),
                 ));
             }
@@ -467,9 +467,11 @@ fn empty_view_hint(panel: RailPanel) -> &'static str {
         RailPanel::Tasks => "no to-dos yet",
         RailPanel::Background => "nothing running in the background",
         RailPanel::Files => "no files touched this session",
-        RailPanel::Notepad => "Enter to write a note",
+        RailPanel::Notepad => "/note add <text> to keep a note",
         RailPanel::Context => "context budget unknown",
-        RailPanel::Git => "not a git repository",
+        // The Git view always paints its own state row ("reading git
+        // status…", "not a git repository", "git unavailable: …").
+        RailPanel::Git => "reading git status…",
         RailPanel::Price => "no priced turns yet",
     }
 }

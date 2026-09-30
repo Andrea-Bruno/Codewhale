@@ -49,7 +49,7 @@ use crate::tui::streaming::StreamingState;
 use crate::tui::transcript::TranscriptViewCache;
 use crate::tui::views::ViewStack;
 use codewhale_localization::{Locale, MessageId, resolve_locale, tr};
-use codewhale_models::{Message, SystemPrompt, Tool, Usage};
+use codewhale_models::{ContentBlock, Message, SystemPrompt, Tool, Usage};
 use codewhale_palette::{self as palette, UiTheme};
 
 mod composer;
@@ -78,7 +78,8 @@ pub use types::{
     ToolCollapseMode, ToolDetailRecord, TranscriptSpacing, TuiOptions, VimMode,
 };
 pub(crate) use types::{
-    CacheReplayTarget, GoalControlIntent, PendingGoalControl, WORKFLOW_DRAFT_INSTRUCTION_PREFIX,
+    CacheReplayTarget, GoalControlIntent, PendingGoalControl, UnansweredSubmission,
+    WORKFLOW_DRAFT_INSTRUCTION_PREFIX,
 };
 
 // === Types ===
@@ -94,6 +95,20 @@ pub(crate) struct PendingMcpLogin {
 pub(crate) enum McpLoginProgress {
     AuthorizationUrl(String),
     Finished(Result<(), String>),
+}
+
+/// One `/mcp retry <name>` in flight. The retry runs as an engine op from a
+/// background task, so a running turn queues it in the engine mailbox instead
+/// of parking the UI loop (#6159) or asking the person to press it again; the
+/// outcome lands in `result` and `poll_mcp_retries` reports it.
+pub(crate) struct PendingMcpRetry {
+    pub server: String,
+    /// A turn owned the engine when the retry was requested, so it waits for
+    /// that turn to finish before it connects.
+    pub queued: bool,
+    pub result: std::sync::Arc<
+        std::sync::Mutex<Option<Result<crate::core::ops::McpManagerUpdate, String>>>,
+    >,
 }
 
 impl Drop for PendingMcpLogin {
@@ -172,30 +187,35 @@ pub enum OnboardingState {
     None,
 }
 
+/// Pick the session's primary skills dir. A workspace directory is chosen only
+/// when the workspace-trust gate admits it; an untrusted repository falls back
+/// to the global dir so its skills neither load nor become the install target.
 pub(crate) fn resolve_skills_dir(
     workspace: &Path,
     global_skills_dir: &Path,
     config: &Config,
 ) -> PathBuf {
+    let admitted =
+        |dir: &Path| crate::skills::skills_dir_allowed_by_workspace_trust(workspace, dir);
     if config.skills_config().scan_codewhale_only() {
         if config.skills_dir.is_some() {
             return global_skills_dir.to_path_buf();
         }
         if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+            && admitted(&codewhale_skills_dir)
         {
             return codewhale_skills_dir;
         }
         return global_skills_dir.to_path_buf();
     }
 
-    let agents_skills_dir = workspace.join(".agents").join("skills");
-    if agents_skills_dir.exists() {
-        return agents_skills_dir;
-    }
-
-    let local_skills_dir = workspace.join("skills");
-    if local_skills_dir.exists() {
-        return local_skills_dir;
+    for local_skills_dir in [
+        workspace.join(".agents").join("skills"),
+        workspace.join("skills"),
+    ] {
+        if local_skills_dir.exists() && admitted(&local_skills_dir) {
+            return local_skills_dir;
+        }
     }
 
     if config.skills_dir.is_none()
@@ -268,16 +288,18 @@ fn initial_onboarding_state(
         return OnboardingState::None;
     }
 
-    if was_onboarded && needs_api_key {
-        // Missing-key recovery uses the canonical provider picker so it can
-        // preserve the configured provider, endpoint, and model route before
-        // asking for a replacement secret.
+    if needs_api_key {
+        // Nothing can answer until a model is connected, so the first screen
+        // is the one that connects it (#6566). A returning user keeps the
+        // configured route focused; a new user sees the provider list. It is
+        // one screen, not the old five-gate wizard, and Esc leaves it for the
+        // composer.
         OnboardingState::Provider
     } else if was_onboarded && needs_workspace_trust {
         OnboardingState::TrustDirectory
     } else {
-        // First paint is the composer. Language, provider, and trust stay in
-        // /setup. A 5-gate wizard must not block the first keystroke.
+        // A new user who already has a key starts at the composer. Language
+        // and trust stay in /setup.
         OnboardingState::None
     }
 }
@@ -304,7 +326,7 @@ fn launch_onboarding_decision(
     needs_workspace_trust: bool,
     xai_oauth_needs_reauth: bool,
 ) -> (OnboardingState, bool) {
-    let onboarding = if xai_oauth_needs_reauth && was_onboarded {
+    let onboarding = if xai_oauth_needs_reauth {
         OnboardingState::None
     } else {
         initial_onboarding_state(
@@ -315,8 +337,10 @@ fn launch_onboarding_decision(
             needs_workspace_trust,
         )
     };
-    let missing_key_recovery =
-        !skip_onboarding && was_onboarded && needs_api_key && !xai_oauth_needs_reauth;
+    // Both a new user and a returning one reach the picker directly, and Esc
+    // returns to the composer. An explicitly configured route is focused even
+    // on first run (see `onboarding_recovers_configured_route`).
+    let missing_key_recovery = !skip_onboarding && needs_api_key && !xai_oauth_needs_reauth;
     (onboarding, missing_key_recovery)
 }
 
@@ -545,6 +569,14 @@ pub struct AgentProgressMeta {
     /// `WorkState` envelope. `None` until a real list is published — the
     /// strip never invents a `0 left` chip for agents with no checklist.
     pub todos_remaining: Option<u32>,
+    /// The engine's name for this agent from its spawn or completion event
+    /// (`subagent_display_name`), used until a manager snapshot arrives.
+    pub display_name: Option<String>,
+    /// When the TUI last received any mailbox envelope from this child. The
+    /// manager's `idle_ms` is only as fresh as the last `AgentList` snapshot,
+    /// and ordinary progress does not refresh that snapshot, so the quiet
+    /// readout caps the engine's clock with this one.
+    pub last_progress_at: Option<Instant>,
 }
 
 /// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).
@@ -958,9 +990,9 @@ pub struct ViewportState {
     /// Painted band occupied by the active approval or question sheet. Stored
     /// so wheel routing can prefer the prompt over side surfaces underneath it.
     pub last_prompt_area: Option<Rect>,
-    /// WorkflowPanel rect above the composer (#4121), for mouse toggle/cancel.
-    pub last_workflow_panel_area: Option<Rect>,
-    pub last_workflow_cancel_area: Option<Rect>,
+    /// The workbar's painted rows under the posture bar; a click there opens
+    /// `/workflows`.
+    pub last_workbar_area: Option<Rect>,
     /// Info-line segment rects (Tideline shell, spec §6), recorded at render so
     /// hover and — in a follow-up slice — click routing can hit-test the
     /// painted cells. Mirrors the workflow-panel cancel-area storage pattern.
@@ -1006,8 +1038,7 @@ impl Default for ViewportState {
             interaction_targets: crate::tui::tideline::InteractionRegistry::default(),
             composer_click_trace: None,
             last_prompt_area: None,
-            last_workflow_panel_area: None,
-            last_workflow_cancel_area: None,
+            last_workbar_area: None,
             last_infoline_hitboxes: Vec::new(),
             last_plugin_cta_area: None,
             last_plugin_cta_review_area: None,
@@ -1092,6 +1123,13 @@ pub struct SessionState {
     /// the ordinary input rate, so folding it into misses understated spend.
     pub total_cache_write_tokens: u32,
     pub total_output_tokens: u32,
+    /// Prompt-cache classes the session's sub-agents and other background
+    /// routes reported, from their drained cost batches (#6565). The same
+    /// per-runtime-session scope as the parent's totals above. `None` until a
+    /// background route reports cache telemetry: absent, never 0%.
+    pub subagent_cache_hit_tokens: Option<u64>,
+    pub subagent_cache_miss_tokens: Option<u64>,
+    pub subagent_cache_write_tokens: Option<u64>,
     /// Turns whose route was money-metered and produced an authoritative
     /// price. These are exactly the turns inside `session_cost`.
     pub cost_priced_turns: u32,
@@ -1192,21 +1230,6 @@ pub enum SidebarRowAction {
     },
 }
 
-impl SidebarRowAction {
-    #[must_use]
-    pub fn as_command(&self) -> Option<&str> {
-        match self {
-            Self::Command(command) => Some(command.as_str()),
-            Self::PrefillCommand(_)
-            | Self::ShowSubagentsPanel
-            | Self::OpenAgentDetail { .. }
-            | Self::OpenAgentTranscript { .. }
-            | Self::CancelAgent { .. }
-            | Self::InspectWork { .. } => None,
-        }
-    }
-}
-
 /// Per-row metadata for sidebar detail popovers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarHoverRow {
@@ -1272,6 +1295,9 @@ impl Default for SessionState {
             total_cache_miss_tokens: 0,
             total_cache_write_tokens: 0,
             total_output_tokens: 0,
+            subagent_cache_hit_tokens: None,
+            subagent_cache_miss_tokens: None,
+            subagent_cache_write_tokens: None,
             cost_priced_turns: 0,
             cost_unpriced_turns: 0,
             cost_cny_priced_turns: 0,
@@ -1302,6 +1328,9 @@ impl SessionState {
         self.total_cache_miss_tokens = 0;
         self.total_cache_write_tokens = 0;
         self.total_output_tokens = 0;
+        self.subagent_cache_hit_tokens = None;
+        self.subagent_cache_miss_tokens = None;
+        self.subagent_cache_write_tokens = None;
         self.clear_pending_turn_usage();
     }
 
@@ -1560,6 +1589,10 @@ pub struct App {
     /// that `TurnComplete { error: .. }` would otherwise emit on top of
     /// the in-transcript error cell.
     pub turn_error_posted: bool,
+    /// Text of the error cell posted for the current turn, when
+    /// `turn_error_posted`. A turn that then ends `Failed` persists exactly
+    /// this text, so resume shows what the live transcript showed.
+    pub(crate) turn_error_notice: Option<String>,
     /// Legacy status text sink retained for compatibility with existing call sites.
     pub status_message: Option<String>,
     /// Recent status toasts (ephemeral, newest at back).
@@ -1624,12 +1657,16 @@ pub struct App {
     /// Updated by `/provider` switches so the UI/commands can read the
     /// active backend without re-deriving it from the live config.
     pub api_provider: ApiProvider,
+    /// The resolved startup config named a provider or model. Capture this
+    /// before runtime synchronization writes even the built-in route to Config;
+    /// missing credentials must not make that choice eligible for discovery.
+    pub(crate) startup_route_configured: bool,
     /// Exact configured provider key for persistence and route restoration.
     /// Built-ins use their canonical slug; named custom providers retain the
     /// user-owned key instead of collapsing to `custom`.
     pub(crate) provider_identity: String,
-    /// Additive exact configured id for persistence. `None` preserves the
-    /// legacy root-level custom route even when a same-key table appears.
+    /// Additive exact configured id for persistence. An id-less `custom`
+    /// record resolves to the literal `[providers.custom]` table (#6394).
     pub(crate) provider_exact_id: Option<String>,
     /// Primary provider plus configured fallback providers for this session.
     pub provider_chain: Option<ProviderChain>,
@@ -1947,6 +1984,21 @@ pub struct App {
     /// Maps raw agent_id to a stable user-facing label (#3030).
     /// Populated when `AgentSpawned` fires; read by sidebar rendering.
     pub agent_label_map: HashMap<String, String>,
+    /// Background work (agents, shells, durable tasks) that finished since
+    /// the last notice, named the way every surface names it. Drained by one
+    /// batched notice (#6565).
+    pub background_finished: Vec<crate::tui::background_finished::FinishedWork>,
+    /// Background shells by owning session, oldest first, capped per session
+    /// at [`crate::tui::background_finished::MAX_FINISHED_SHELLS`]. They stay listed, muted, so
+    /// a person can see what ran and how it ended (#6565).
+    pub finished_shell_ids: HashMap<String, VecDeque<String>>,
+    /// Completion deduplication is independent of visible rows and their cap.
+    /// IDs are manager-unique; these sets live only for this TUI process.
+    pub notified_shell_ids: HashSet<String>,
+    pub notified_task_ids: HashSet<String>,
+    /// When the latest `AgentList` snapshot arrived, so a running agent's
+    /// engine idle clock keeps counting between snapshots.
+    pub subagent_cache_received_at: Option<Instant>,
     /// The child whose full transcript currently owns the main conversation
     /// area and whose fork the composer addresses (`None` = main session).
     pub agent_focus: Option<crate::tui::agent_focus::AgentFocus>,
@@ -1963,10 +2015,6 @@ pub struct App {
     /// `/agents list` asked for a one-shot transcript listing. Cleared by the
     /// `AgentList` handler that prints it.
     pub agent_roster_print_requested: bool,
-    /// Per-role sequence counters for unnamed children (#3030). Two concurrent
-    /// builders render as `builder · 1` and `builder · 2` instead of sharing a
-    /// bare, indistinguishable role label.
-    pub agent_role_counters: HashMap<String, u64>,
     /// Last time a sub-agent progress event triggered a redraw.
     /// Used to throttle redraws under high sub-agent concurrency (#3033).
     pub last_agent_progress_redraw: Option<Instant>,
@@ -2109,6 +2157,9 @@ pub struct App {
     pub(crate) current_session_metadata: Option<SessionMetadata>,
     /// Metadata-only registry of large tool outputs produced in this session.
     pub session_artifacts: Vec<ArtifactRecord>,
+    /// Turns in this session that ended `Failed`, persisted with the session
+    /// so the reason survives the TUI closing.
+    pub(crate) session_turn_outcomes: Vec<crate::session_manager::SavedTurnOutcome>,
     /// Trust mode - allow access outside workspace
     pub trust_mode: bool,
     /// Translation mode — when enabled, the model is instructed to respond in
@@ -2270,7 +2321,7 @@ pub struct App {
     /// Last completed reasoning block
     pub last_reasoning: Option<String>,
     /// Tool calls captured for the pending assistant message
-    pub pending_tool_uses: Vec<(String, String, Value)>,
+    pub pending_tool_uses: Vec<ContentBlock>,
     /// One-line permission receipts (`tool_id`, text) for decisions nobody
     /// was prompted for, held until that tool's card completes so the note
     /// lands directly under the card instead of splitting a running tool run.
@@ -2359,6 +2410,8 @@ pub struct App {
     /// Discovery, registration and the browser callback all run in the
     /// background. Esc or dropping the app cancels the entire operation.
     pub(crate) mcp_login: Option<PendingMcpLogin>,
+    /// `/mcp retry` requests still waiting on the engine, one per server.
+    pub(crate) mcp_retries: Vec<PendingMcpRetry>,
     /// Shared cell for async prompt suggestion delivery from background task.
     pub prompt_suggestion_cell: std::sync::Arc<std::sync::Mutex<Option<(u64, String)>>>,
     /// Tracks whether the initial balance fetch has been attempted for this session.
@@ -2392,6 +2445,9 @@ pub struct App {
     /// instead of inside the draw closure (#3908) — tens of ms per frame on
     /// NFS/SSHFS/cloud-synced homes otherwise.
     pub memory_size_hint: Option<String>,
+    /// The workspace notes (`/note`), refreshed with the workspace context
+    /// off the render path; the dock's NOTES view lists them (#6565).
+    pub workspace_notes: Vec<String>,
     /// Cached background tasks for sidebar rendering.
     pub task_panel: Vec<TaskPanelEntry>,
     pub task_panel_session_id: Option<String>,
@@ -2414,10 +2470,11 @@ pub struct App {
     /// every frame, so the counts live here rather than behind a
     /// settings-file read.
     pub footer_hint_uses: std::collections::BTreeMap<String, u8>,
-    /// Unified Workflow activity surface (#4121). Lives above the composer so
-    /// phase/row progress does not flood the chat transcript. Preserved after
-    /// completion until the next `RunStarted` replaces it.
-    pub workflow_panel: Option<crate::tui::widgets::workflow_panel::WorkflowPanel>,
+    /// Every workflow run this session is showing, in start order, one state
+    /// per run id (#4121). The workbar under the composer paints one row per
+    /// run; the transcript gets only each run's start and finish lines.
+    /// Settled runs stay until a later turn starts with nothing still running.
+    pub workflow_runs: Vec<crate::tui::widgets::workflow_panel::WorkflowPanel>,
     /// Wall-clock time when this TUI session started. Used by the Work
     /// sidebar projection to hide completed durable tasks that finished
     /// before the current session (bug #1913).
@@ -2462,6 +2519,9 @@ pub struct App {
     /// Most recent user prompt accepted for an active engine turn. Ctrl+C can
     /// restore this into an empty composer after cancelling that turn.
     pub last_submitted_prompt: Option<String>,
+    /// The dispatched message of the turn in flight, until that turn ends.
+    /// A credential rejection the engine marks unsent hands it back (#6566).
+    pub unanswered_submission: Option<UnansweredSubmission>,
     /// Startup prompt should be submitted automatically after the engine is ready.
     pub auto_submit_initial_input: bool,
     /// Two-tap quit confirmation. When set, a prior Ctrl+C in idle state has
@@ -2631,12 +2691,7 @@ impl App {
         if self.launch.visible {
             return Focus::Launch;
         }
-        if self.work_surface.focused
-            || self
-                .workflow_panel
-                .as_ref()
-                .is_some_and(|panel| panel.keyboard_focus)
-        {
+        if self.work_surface.focused {
             return Focus::Panel;
         }
         Focus::Composer
@@ -2997,6 +3052,14 @@ impl App {
         );
         self.hotbar_actions.replace_skills(&cached_skills);
         self.cached_skills = cached_skills;
+    }
+
+    /// Whether the onboarding provider picker should focus the saved route.
+    /// A fresh home can already name a route in config. Only an unconfigured
+    /// new user has the built-in default rather than a route to recover.
+    pub(crate) fn onboarding_recovers_configured_route(&self) -> bool {
+        self.onboarding_missing_key_recovery
+            && (self.startup_route_configured || !self.onboarding_had_provider_step)
     }
 
     pub fn finish_onboarding_without_feature_intro(&mut self) {
@@ -3411,9 +3474,8 @@ impl App {
 
     /// Advance reasoning effort to the next tier for the active route and
     /// surface the change: set a status message and refresh the compaction
-    /// budget. Auto routing retains the full provider-neutral vocabulary until
-    /// dispatch; a concrete model walks the same ladder as `/model` and
-    /// `/effort`. Shared by the Ctrl+T shortcut (`cycle_effort`) and the
+    /// budget. Auto routing and concrete models alike walk the same ladder as
+    /// `/model` and `/effort`. Shared by the Ctrl+T shortcut (`cycle_effort`) and the
     /// hotbar `reasoning.cycle` action so the two paths cannot drift.
     pub(crate) fn apply_reasoning_effort_cycle(&mut self) {
         let requested = self.next_reasoning_effort_for_active_route();
@@ -3421,9 +3483,6 @@ impl App {
     }
 
     fn next_reasoning_effort_for_active_route(&self) -> ReasoningEffort {
-        if self.auto_model {
-            return self.reasoning_effort.cycle_next_for_auto_model();
-        }
         let (provider, base_url, model) = match self.active_reasoning_route_truth() {
             Some((provider, _, endpoint, model)) => (provider, endpoint, model),
             None => (
@@ -3432,9 +3491,33 @@ impl App {
                 self.model.as_str(),
             ),
         };
-        let efforts =
-            crate::tui::model_picker::picker_efforts_for_route(provider, base_url, model, false);
-        self.reasoning_effort.cycle_next_in(&efforts)
+        // The exact ladder the `/model` picker shows for this route, Auto
+        // routing included (#6650). On a concrete route every rung is a
+        // distinct effective tier; under Auto routing the tier is decided at
+        // dispatch, so neighbouring preferences may still resolve to one tier.
+        let efforts = crate::tui::model_picker::picker_efforts_for_route(
+            provider,
+            base_url,
+            model,
+            self.auto_model,
+        );
+        // A persisted value the ladder dropped as an alias (DeepSeek `medium`)
+        // enters at the rung it already resolves to, so the first press moves
+        // past it instead of re-selecting the same effective tier.
+        let current = self.reasoning_effort;
+        let anchor = if self.auto_model || efforts.contains(&current) {
+            current
+        } else {
+            let tier = crate::tui::model_picker::effective_tier_for_route(
+                current, provider, base_url, model,
+            );
+            if efforts.contains(&tier) {
+                tier
+            } else {
+                current
+            }
+        };
+        anchor.cycle_next_in(&efforts)
     }
 
     pub(crate) fn commit_reasoning_effort(&mut self, requested: ReasoningEffort) {
@@ -4042,6 +4125,23 @@ impl App {
         if pool.estimate.is_positive() {
             self.accrue_subagent_cost_estimate(pool.estimate);
         }
+        let add = |slot: &mut Option<u64>, tokens: Option<u64>| {
+            if let Some(tokens) = tokens {
+                *slot = Some(slot.unwrap_or(0).saturating_add(tokens));
+            }
+        };
+        add(
+            &mut self.session.subagent_cache_hit_tokens,
+            pool.cache_hit_tokens,
+        );
+        add(
+            &mut self.session.subagent_cache_miss_tokens,
+            pool.cache_miss_tokens,
+        );
+        add(
+            &mut self.session.subagent_cache_write_tokens,
+            pool.cache_write_tokens,
+        );
         self.absorb_background_cost_coverage(pool);
         runtime_usage_arrived
     }
@@ -4427,9 +4527,12 @@ impl App {
         self.collapsed_cell_map.clear();
     }
 
-    /// Resolve the dispatch/session name for an agent. `None` when the agent
-    /// is unnamed (the manager seeds `name` with the raw id) or absent from
-    /// the cache — the raw id is a lookup handle, never a display name.
+    /// The name a sub-agent was dispatched under, when it has one (#5287).
+    ///
+    /// `SubAgentResult::name` carries the session name, which the manager
+    /// seeds with the agent id and only replaces when the dispatch supplied a
+    /// name. An id is a lookup handle, never the identity an operator
+    /// dispatched by, so it is reported as absent here.
     fn agent_session_name(&self, agent_id: &str) -> Option<String> {
         let agent = self
             .subagent_cache
@@ -4437,55 +4540,6 @@ impl App {
             .find(|agent| agent.agent_id == agent_id)?;
         let name = agent.name.trim();
         (!name.is_empty() && name != agent.agent_id).then(|| name.to_string())
-    }
-
-    /// Resolve the most specific member/role token for an agent, in priority
-    /// order: resolved profile id, advisory assignment role, requested alias,
-    /// canonical route role, then Fleet type. `None` only for a
-    /// progress-only agent whose dispatch metadata has not arrived yet.
-    fn agent_role_label(&self, agent_id: &str) -> Option<String> {
-        let agent = self
-            .subagent_cache
-            .iter()
-            .find(|agent| agent.agent_id == agent_id)?;
-        agent
-            .child_route
-            .as_ref()
-            .and_then(|route| route.resolved_profile_id.as_deref())
-            .map(str::trim)
-            .filter(|profile| !profile.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                agent
-                    .assignment
-                    .role
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|role| !role.is_empty())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                agent
-                    .child_route
-                    .as_ref()
-                    .and_then(|route| route.requested_profile.as_deref())
-                    .map(str::trim)
-                    .filter(|profile| !profile.is_empty())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                agent
-                    .child_route
-                    .as_ref()
-                    .map(|route| route.canonical_role.trim())
-                    .filter(|role| !role.is_empty())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                let role = agent.agent_type.as_str().trim();
-                (!role.is_empty()).then(|| role.to_string())
-            })
-            .map(|role| crate::fleet::role::public_role_label(&role))
     }
 
     /// `true` for the `Agent N` counter placeholder assigned before a child's
@@ -4497,29 +4551,60 @@ impl App {
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     }
 
-    /// Resolve the identity-backed label for an agent, or `None` when no
-    /// identity field is populated (so the caller falls back to a counter
-    /// placeholder). Named children keep their name and gain a role suffix
-    /// when the role is not already part of the name; unnamed children are
-    /// disambiguated with a per-role sequence counter.
+    /// The engine's name for an agent (#6565): resolved from the manager
+    /// snapshot when there is one, else from the name its spawn or completion
+    /// event carried. `None` only for a progress-only agent whose identity has
+    /// not arrived yet, so the caller falls back to a counter placeholder.
+    fn engine_agent_name(&self, agent_id: &str) -> Option<String> {
+        self.subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)
+            .map(crate::tools::subagent::subagent_result_display_name)
+            .or_else(|| {
+                self.agent_progress_meta
+                    .get(agent_id)
+                    .and_then(|meta| meta.display_name.clone())
+            })
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty() && name != agent_id)
+    }
+
+    /// The engine's name, made unique among the labels already shown: two
+    /// parallel "review" tasks read "review" and "review · 2", the only thing
+    /// the TUI adds to the engine's name.
     fn resolved_identity_label(&mut self, agent_id: &str) -> Option<String> {
-        let name = self.agent_session_name(agent_id);
-        let role = self.agent_role_label(agent_id);
-        match (name, role) {
-            (Some(name), Some(role)) if !name.contains(&role) => Some(format!("{name} · {role}")),
-            (Some(name), _) => Some(name),
-            (None, Some(role)) => {
-                let next = self.agent_role_counters.entry(role.clone()).or_insert(0);
-                *next += 1;
-                Some(format!("{role} · {next}"))
-            }
-            (None, None) => None,
+        let name = self.engine_agent_name(agent_id)?;
+        let shown_by_another = |candidate: &str| {
+            self.agent_label_map
+                .iter()
+                .any(|(id, shown)| id != agent_id && shown == candidate)
+        };
+        let mut unique = name.clone();
+        let mut sequence = 1u64;
+        while shown_by_another(&unique) {
+            sequence += 1;
+            unique = format!("{name} · {sequence}");
         }
+        Some(unique)
     }
 
     fn next_agent_placeholder(&mut self) -> String {
         self.agent_counter = self.agent_counter.saturating_add(1);
         format!("Agent {}", self.agent_counter)
+    }
+
+    /// The name this agent was *given*: its workflow task label or another
+    /// explicit nickname, else its dispatch (session) name. `None` for an
+    /// agent that goes by its role, so a surface can fall back to its own
+    /// placeholder (a generated whale name on the sidebar).
+    pub(crate) fn agent_given_name(&self, agent_id: &str) -> Option<String> {
+        let agent = self
+            .subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)?;
+        crate::tools::subagent::explicit_nickname(agent_id, agent.nickname.as_deref())
+            .map(str::to_string)
+            .or_else(|| self.agent_session_name(agent_id))
     }
 
     /// #3030: return the stable user-facing label for an agent id. Labels are
@@ -4725,6 +4810,7 @@ impl App {
         self.context_references_by_cell.clear();
         self.session_context_references.clear();
         self.session_artifacts.clear();
+        self.session_turn_outcomes.clear();
         self.prune_transcript_index_state(0);
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
@@ -5114,8 +5200,8 @@ impl App {
         })
     }
 
-    /// Pick the detail target for the current viewport. This is used by the
-    /// transcript highlight and footer hint so they agree with `v`.
+    /// Pick the detail target for the current viewport. The footer hint and
+    /// Alt+V both resolve through this so they agree on the target.
     #[must_use]
     pub fn detail_cell_index_for_viewport(
         &self,
@@ -5357,6 +5443,9 @@ impl App {
         {
             self.scroll_to_bottom();
         }
+        // A foreground workflow's finish line waits for its start card to
+        // leave the active group, so the transcript reads started → finished.
+        self.announce_settled_workflows();
     }
 
     /// Mark every still-running entry in the active cell as interrupted, then
@@ -5365,23 +5454,19 @@ impl App {
         if let Some(active) = self.active_cell.as_mut() {
             active.mark_in_progress_as_interrupted();
         }
+        // A detached workflow outlives the turn that started it, and a
+        // foreground one is cancelled by the engine, which says so with its
+        // own `run_cancelled`. Neither is marked here.
         self.flush_active_cell();
-        // #4121: interrupt finalizes running workflow children as cancelled
-        // and preserves the completed panel until the next run starts.
-        if let Some(panel) = self.workflow_panel.as_mut() {
-            panel.finalize_interrupt();
-            self.needs_redraw = true;
-        }
     }
 
-    /// Apply a workflow panel event for one immutable workflow run, creating
-    /// the panel on first `RunStarted`.
+    /// Apply one event to the run it names, creating that run's state on
+    /// first sight. Runs are independent: a newer run never replaces one that
+    /// is still going, so ten concurrent workflows are ten rows.
     ///
-    /// Returns whether the event belonged to the displayed run and was
-    /// applied. Budget-only updates still return `true`, but leave repaint to
-    /// the caller so high-frequency fan-out budget ticks can be paced (#4095).
-    /// A `RunStarted` event may select a different run only when its start is
-    /// strictly newer; every other cross-run event fails closed.
+    /// Returns whether the event was applied. Only a run's start and end ask
+    /// for a repaint here; progress leaves it to the caller, which paces a
+    /// fan-out's event stream (#4095).
     pub fn apply_workflow_panel_event(
         &mut self,
         event_run_id: &str,
@@ -5398,17 +5483,14 @@ impl App {
         {
             return false;
         }
-        if let Some(panel) = self.workflow_panel.as_ref()
-            && panel.run_id != event_run_id
-        {
-            match &event {
-                WorkflowPanelEvent::RunStarted { at_ms, .. } if *at_ms > panel.started_at_ms => {}
-                _ => return false,
-            }
-        }
 
-        let budget_only = matches!(&event, WorkflowPanelEvent::BudgetUpdated { .. });
-        // #5528: a failed run must be loud, not just a panel row. Capture the
+        let lifecycle = matches!(
+            &event,
+            WorkflowPanelEvent::RunStarted { .. }
+                | WorkflowPanelEvent::RunCompleted { .. }
+                | WorkflowPanelEvent::RunCancelled { .. }
+        );
+        // #5528: a failed run must be loud, not just a row. Capture the
         // failure before the event is consumed below; the sticky notice fires
         // once per run because the live stream and the tool-complete hydration
         // can both deliver the same terminal event.
@@ -5420,10 +5502,20 @@ impl App {
             } => Some(error.clone()),
             _ => None,
         };
-        let already_failed = self.workflow_panel.as_ref().is_some_and(|panel| {
-            panel.run_id == event_run_id && panel.lifecycle == WorkflowPanelLifecycle::Failed
+        // A cancelled run stays cancelled (the panel ignores a late
+        // `run_completed`), so it must not raise a failure notice either.
+        let existing = self
+            .workflow_runs
+            .iter()
+            .position(|panel| panel.run_id == event_run_id);
+        let already_failed = existing.is_some_and(|index| {
+            matches!(
+                self.workflow_runs[index].lifecycle,
+                WorkflowPanelLifecycle::Failed | WorkflowPanelLifecycle::Cancelled
+            )
         });
-        match (&mut self.workflow_panel, &event) {
+        match (existing, &event) {
+            (Some(index), _) => self.workflow_runs[index].apply_event(event),
             (
                 None,
                 WorkflowPanelEvent::RunStarted {
@@ -5443,31 +5535,37 @@ impl App {
                 panel.locale = self.ui_locale;
                 panel.budget_total = *token_budget;
                 panel.budget_remaining = *token_budget;
-                self.workflow_panel = Some(panel);
+                self.push_workflow_run(panel);
             }
             (None, _) => {
-                // No panel yet and event is not a start — seed a shell panel
-                // so late events still surface rather than being dropped.
+                // A late event for a run this view never saw start still
+                // surfaces, under its id, rather than being dropped.
                 let mut panel = WorkflowPanel::new(event_run_id, event_run_id, 0);
                 panel.locale = self.ui_locale;
                 panel.apply_event(event);
-                self.workflow_panel = Some(panel);
-            }
-            (Some(panel), _) => {
-                panel.apply_event(event);
+                self.push_workflow_run(panel);
             }
         }
-        if !budget_only {
+        if lifecycle {
             self.needs_redraw = true;
         }
         if let Some(error) = run_failure
             && !already_failed
         {
-            let detail = error
-                .as_deref()
-                .map(str::trim)
-                .filter(|detail| !detail.is_empty());
-            let message = match detail {
+            // The same reason the workbar and the finish row show: a failed
+            // agent's own cause ("Authorization failed: …") when nothing
+            // succeeded, not the run's aggregate summary.
+            let detail = self
+                .workflow_run(event_run_id)
+                .and_then(WorkflowPanel::outcome_reason)
+                .or_else(|| {
+                    error
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|detail| !detail.is_empty())
+                        .map(str::to_string)
+                });
+            let message = match detail.as_deref() {
                 Some(detail) => format!(
                     "{} · {}",
                     self.tr(MessageId::WorkflowRunFailedToast),
@@ -5481,18 +5579,213 @@ impl App {
                 Some(Self::STICKY_ERROR_TTL_MS),
             );
         }
+        self.announce_settled_workflows();
         true
     }
 
-    /// Toggle the workflow panel expand/collapse state. Returns true when a
-    /// panel was present and toggled.
-    pub fn toggle_workflow_panel(&mut self) -> bool {
-        let Some(panel) = self.workflow_panel.as_mut() else {
-            return false;
+    /// Most runs kept at once. Past it the oldest settled run goes first; a
+    /// live run is never evicted.
+    const MAX_WORKFLOW_RUNS: usize = 64;
+
+    pub(crate) fn push_workflow_run(
+        &mut self,
+        panel: crate::tui::widgets::workflow_panel::WorkflowPanel,
+    ) {
+        self.workflow_runs.push(panel);
+        while self.workflow_runs.len() > Self::MAX_WORKFLOW_RUNS {
+            let Some(oldest_settled) = self
+                .workflow_runs
+                .iter()
+                .position(|run| run.lifecycle.is_terminal() && run.finish_announced)
+            else {
+                break;
+            };
+            self.workflow_runs.remove(oldest_settled);
+        }
+    }
+
+    /// The state of one run, by id.
+    pub(crate) fn workflow_run(
+        &self,
+        run_id: &str,
+    ) -> Option<&crate::tui::widgets::workflow_panel::WorkflowPanel> {
+        self.workflow_runs.iter().find(|run| run.run_id == run_id)
+    }
+
+    pub(crate) fn workflow_run_mut(
+        &mut self,
+        run_id: &str,
+    ) -> Option<&mut crate::tui::widgets::workflow_panel::WorkflowPanel> {
+        self.workflow_runs
+            .iter_mut()
+            .find(|run| run.run_id == run_id)
+    }
+
+    /// Whether any workflow run is still going.
+    pub(crate) fn workflow_run_live(&self) -> bool {
+        self.workflow_runs
+            .iter()
+            .any(|run| run.lifecycle.is_running())
+    }
+
+    /// A new turn clears settled rows from the workbar once nothing is still
+    /// running — their finish lines are already in the transcript. While any
+    /// run is live the settled ones stay, so a batch reads as one batch.
+    pub(crate) fn prune_settled_workflow_runs(&mut self) {
+        if self.workflow_run_live() {
+            return;
+        }
+        let before = self.workflow_runs.len();
+        self.workflow_runs
+            .retain(|run| !(run.lifecycle.is_terminal() && run.finish_announced));
+        if self.workflow_runs.len() != before {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Write each settled run's finish line into the transcript, once. The
+    /// line is a `workflow` card marked `transcript_line: finished`, so it
+    /// reuses the card renderer and expands in Transcript mode.
+    ///
+    /// One row per run: when the call that started the run is already in
+    /// history (its call returned, its record still says running) and the
+    /// conversation has not moved past it, that card becomes the finish — the
+    /// final state replaces `started` rather than stacking a second row under
+    /// it. A run that settles after a later user message gets its finish at
+    /// the tail, where it is seen. The card's tool-detail record is keyed
+    /// separately and still holds what the model saw.
+    ///
+    /// While a `workflow` card is still in the active group (a foreground
+    /// `run`, or a `start` whose turn has not flushed) the line waits: pushed
+    /// now it would land above the card that started it. `flush_active_cell`
+    /// calls back here once the card is in history.
+    pub(crate) fn announce_settled_workflows(&mut self) {
+        use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
+        use crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle;
+        if !self
+            .workflow_runs
+            .iter()
+            .any(|run| run.lifecycle.is_terminal() && !run.finish_announced)
+        {
+            return;
+        }
+        let card_in_flight = self.active_cell.as_ref().is_some_and(|active| {
+            active.entries().iter().any(|cell| {
+                matches!(cell, HistoryCell::Tool(ToolCell::Generic(tool)) if tool.name == "workflow")
+            })
+        });
+        if card_in_flight {
+            return;
+        }
+        let record_of = |tool: &GenericToolCell| {
+            tool.output
+                .as_deref()
+                .and_then(|out| serde_json::from_str::<serde_json::Value>(out).ok())
         };
-        let _ = panel.toggle_expanded();
+        // A foreground `run` card that returned its settled record already
+        // shows the finish (history.rs); writing another would say it twice.
+        let card_owns_finish = |history: &[HistoryCell], run_id: &str| {
+            history.iter().rev().any(|cell| {
+                let HistoryCell::Tool(ToolCell::Generic(tool)) = cell else {
+                    return false;
+                };
+                if tool.name != "workflow" || tool.status == ToolStatus::Running {
+                    return false;
+                }
+                let Some(value) = record_of(tool) else {
+                    return false;
+                };
+                value.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
+                    && value.get("transcript_line").is_none()
+                    && matches!(
+                        value.get("status").and_then(serde_json::Value::as_str),
+                        Some("completed" | "succeeded" | "degraded" | "failed" | "cancelled")
+                    )
+            })
+        };
+        // The card that started this run, when it is still showing `started`
+        // and still in the current exchange. The first card naming a run is
+        // the one that launched it (the id does not exist before `start`); a
+        // later `status` poll returns the same running shape and must not be
+        // mistaken for it. Once the conversation has moved on (a user message
+        // after the card), rewriting a row far up in scrollback would leave
+        // nothing at the tail to say the run settled, so the finish is
+        // appended instead. A card whose call is still running is left alone:
+        // its result would overwrite the finish.
+        let start_card = |history: &[HistoryCell], run_id: &str| {
+            let first = history.iter().position(|cell| {
+                let HistoryCell::Tool(ToolCell::Generic(tool)) = cell else {
+                    return false;
+                };
+                tool.name == "workflow"
+                    && record_of(tool).is_some_and(|value| {
+                        value.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
+                            && value.get("transcript_line").is_none()
+                    })
+            })?;
+            let HistoryCell::Tool(ToolCell::Generic(tool)) = &history[first] else {
+                return None;
+            };
+            let still_started = tool.status != ToolStatus::Running
+                && record_of(tool).is_some_and(|value| {
+                    matches!(
+                        value.get("status").and_then(serde_json::Value::as_str),
+                        None | Some("running" | "pending" | "started")
+                    )
+                });
+            let same_exchange = !history[first + 1..]
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::User { .. }));
+            (still_started && same_exchange).then_some(first)
+        };
+        let mut replaced = Vec::new();
+        let mut lines = Vec::new();
+        for run in &mut self.workflow_runs {
+            if !run.lifecycle.is_terminal() || run.finish_announced {
+                continue;
+            }
+            run.finish_announced = true;
+            // A later card (a `status` poll, a foreground `run`) that returned
+            // the settled record already shows the finish; rewriting the start
+            // card too would say it twice.
+            if card_owns_finish(&self.history, &run.run_id) {
+                continue;
+            }
+            let start = start_card(&self.history, &run.run_id);
+            let mut output = run.to_run_json();
+            output["transcript_line"] = serde_json::Value::from("finished");
+            let status = match run.lifecycle {
+                WorkflowPanelLifecycle::Succeeded => ToolStatus::Success,
+                WorkflowPanelLifecycle::Degraded => ToolStatus::Warning,
+                _ => ToolStatus::Failed,
+            };
+            if let Some(index) = start
+                && let Some(HistoryCell::Tool(ToolCell::Generic(card))) =
+                    self.history.get_mut(index)
+            {
+                card.status = status;
+                card.output = Some(output.to_string());
+                replaced.push(index);
+                continue;
+            }
+            lines.push(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: "workflow".to_string(),
+                status,
+                input_summary: None,
+                output: Some(output.to_string()),
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            })));
+        }
+        for index in replaced {
+            self.bump_history_cell(index);
+        }
+        for line in lines {
+            self.add_message(line);
+        }
         self.needs_redraw = true;
-        true
     }
 
     /// How long the "press Ctrl+C again to quit" prompt stays armed before it

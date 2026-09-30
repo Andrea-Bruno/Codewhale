@@ -561,6 +561,13 @@ impl SshFleetHostConfig {
                 "SSH Fleet host requires an explicit host",
             ));
         }
+        // The destination is a single ssh argument. A leading '-' would be read
+        // as an ssh option, and whitespace/control characters would change what
+        // ssh or the remote shell receives.
+        validate_ssh_destination_part("host", &self.host)?;
+        if let Some(user) = self.user.as_ref().filter(|user| !user.trim().is_empty()) {
+            validate_ssh_destination_part("user", user)?;
+        }
         if self.codewhale_binary.trim().is_empty() {
             return Err(FleetHostError::configuration(
                 "SSH Fleet host requires an explicit codewhale binary path",
@@ -569,6 +576,31 @@ impl SshFleetHostConfig {
         if self.working_directory.as_os_str().is_empty() {
             return Err(FleetHostError::configuration(
                 "SSH Fleet host requires an explicit working directory",
+            ));
+        }
+        // Fingerprint-only verification is not implemented by the OpenSSH adapter.
+        // Refuse a configured pin rather than silently substituting another trust source.
+        if self.host_key_fingerprint.is_some() {
+            return Err(FleetHostError::configuration(
+                "SSH Fleet host_key_fingerprint is unsupported; configure known_hosts instead",
+            ));
+        }
+        if self
+            .known_hosts
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(FleetHostError::configuration(
+                "SSH Fleet known_hosts must not be empty",
+            ));
+        }
+        if self
+            .known_hosts
+            .as_ref()
+            .is_some_and(|path| path.to_string_lossy().contains(['"', '\n', '\r']))
+        {
+            return Err(FleetHostError::configuration(
+                "SSH Fleet known_hosts contains unsupported characters",
             ));
         }
         validate_env_allowlist(&self.env_allowlist)
@@ -608,8 +640,24 @@ impl SshFleetHostAdapter {
             "-o".to_string(),
             "BatchMode=yes".to_string(),
             "-o".to_string(),
+            "StrictHostKeyChecking=yes".to_string(),
+            "-o".to_string(),
             format!("ConnectTimeout={}", self.config.connect_timeout_seconds),
         ];
+        if let Some(known_hosts) = &self.config.known_hosts {
+            args.push("-o".to_string());
+            args.push(format!("UserKnownHostsFile=\"{}\"", known_hosts.display()));
+            args.push("-o".to_string());
+            args.push("GlobalKnownHostsFile=none".to_string());
+            args.push("-o".to_string());
+            // IgnoreUnknown predates OpenSSH 7.x. Older clients have no
+            // KnownHostsCommand; newer ones must disable that extra trust source.
+            args.push("IgnoreUnknown=KnownHostsCommand".to_string());
+            args.push("-o".to_string());
+            args.push("KnownHostsCommand=none".to_string());
+            args.push("-o".to_string());
+            args.push("VerifyHostKeyDNS=no".to_string());
+        }
         for key in env.keys() {
             args.push("-o".to_string());
             args.push(format!("SendEnv={key}"));
@@ -622,6 +670,8 @@ impl SshFleetHostAdapter {
             args.push("-i".to_string());
             args.push(identity.display().to_string());
         }
+        // End option parsing so the destination can never be read as an option.
+        args.push("--".to_string());
         args.push(self.config.target());
         args.push(self.remote_command(request));
         Ok(FleetWorkerCommand::new(
@@ -1364,6 +1414,28 @@ fn filtered_env(
         .collect())
 }
 
+/// Characters OpenSSH itself refuses in a command-line user or host name
+/// because an `ssh_config` `%h`/`%r` expansion can hand them to a shell.
+const SSH_DESTINATION_METACHARACTERS: &str = "'`\"$\\;&<>|(){}";
+
+fn validate_ssh_destination_part(label: &str, value: &str) -> FleetHostResult<()> {
+    let allowed = |ch: char| {
+        if label == "host" {
+            // Host names, IPv4/IPv6 literals (with a zone id) and ssh_config
+            // aliases. `@` would move the user/host split.
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':' | '%')
+        } else {
+            ch.is_ascii_graphic() && !SSH_DESTINATION_METACHARACTERS.contains(ch)
+        }
+    };
+    if value.starts_with('-') || !value.chars().all(allowed) {
+        return Err(FleetHostError::configuration(format!(
+            "SSH Fleet {label} must not start with '-' or contain whitespace, control, non-ASCII or shell characters"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_env_allowlist(allowlist: &BTreeSet<String>) -> FleetHostResult<()> {
     for key in allowlist {
         if !is_safe_env_key(key) {
@@ -1402,19 +1474,24 @@ fn ssh_client_env() -> BTreeMap<String, String> {
 }
 
 fn process_base_env() -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    for key in [
-        "HOME",
-        "PATH",
-        "SYSTEMROOT",
-        "SystemRoot",
-        "COMSPEC",
-        "ComSpec",
-    ] {
-        if let Ok(value) = std::env::var(key) {
-            env.insert(key.to_string(), value);
-        }
-    }
+    base_env_from(std::env::vars_os())
+}
+
+/// The worker's inherited environment: the repository's scrubbed child-env
+/// allowlist (`child_env`), so proxy routing, CA bundles, temp directories,
+/// Windows system/profile roots, locale and toolchain paths survive
+/// `env_clear()` while provider keys and other secret-shaped names do not.
+/// Proxy URLs keep their credentials for the worker process itself; see
+/// [`crate::child_env::sanitized_runtime_env_from`] for that policy.
+fn base_env_from<K, V>(parent: impl IntoIterator<Item = (K, V)>) -> BTreeMap<String, String>
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let mut env: BTreeMap<String, String> = crate::child_env::sanitized_runtime_env_from(parent)
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     force_worker_telemetry_off(&mut env);
     env
 }
@@ -2062,6 +2139,199 @@ mod tests {
         assert!(argv.contains("/usr/local/bin/codewhale"));
         assert!(argv.contains("fleet-worker"));
         assert!(!argv.contains("super-secret-profile-value"));
+        // Option parsing ends right before the destination.
+        let target = command
+            .args
+            .iter()
+            .position(|arg| arg == "fleet@builder.example.test")
+            .expect("destination argument");
+        assert_eq!(command.args[target - 1], "--");
+    }
+
+    #[test]
+    fn fleet_host_ssh_refuses_option_like_or_malformed_destination() {
+        let tmp = TempDir::new().unwrap();
+        for host in [
+            "-oProxyCommand=true",
+            "builder example.test",
+            "builder\nexample.test",
+            "builder\0example.test",
+            "builder;true",
+            "builder$(true)",
+            "builder`true`",
+            "fleet@builder.example.test",
+            "builder\u{202e}.example.test",
+        ] {
+            let config = SshFleetHostConfig::new(host, "/srv/codewhale");
+            let err = SshFleetHostAdapter::new(tmp.path(), config)
+                .expect_err("malformed SSH host must be refused");
+            assert_eq!(err.kind, FleetHostErrorKind::Configuration, "{host:?}");
+            assert!(err.message.contains("SSH Fleet host"), "{}", err.message);
+        }
+        for user in [
+            "-oProxyCommand=true",
+            "fleet user",
+            "fleet\tuser",
+            "fleet\0user",
+            "fleet;true",
+            "fleet$(true)",
+            "fleet|true",
+            "fl\u{e9}et",
+        ] {
+            let mut config = SshFleetHostConfig::new("builder.example.test", "/srv/codewhale");
+            config.user = Some(user.to_string());
+            let err = SshFleetHostAdapter::new(tmp.path(), config)
+                .expect_err("malformed SSH user must be refused");
+            assert_eq!(err.kind, FleetHostErrorKind::Configuration, "{user:?}");
+            assert!(err.message.contains("SSH Fleet user"), "{}", err.message);
+        }
+        let spec = FleetHostSpec::Ssh {
+            host: "-oProxyCommand=true".to_string(),
+            port: None,
+            user: None,
+            identity: None,
+            known_hosts: None,
+            host_key_fingerprint: None,
+            working_directory: Some(PathBuf::from("/srv/codewhale")),
+            env_allowlist: Vec::new(),
+            codewhale_binary: Some("codewhale".to_string()),
+        };
+        assert!(SshFleetHostConfig::from_host_spec(&spec).is_err());
+
+        // Ordinary destinations stay accepted, including a directory-style
+        // user name and IPv6 literals with a zone id.
+        for (user, host) in [
+            (Some("fleet"), "builder.example.test"),
+            (Some("alice@corp.example"), "10.0.0.7"),
+            (None, "fe80::1%en0"),
+            (Some("ci_bot-2"), "build_box-01"),
+        ] {
+            let mut config = SshFleetHostConfig::new(host, "/srv/codewhale");
+            config.user = user.map(str::to_string);
+            SshFleetHostAdapter::new(tmp.path(), config)
+                .unwrap_or_else(|err| panic!("{user:?}@{host} must be accepted: {err:?}"));
+        }
+    }
+
+    #[test]
+    fn worker_base_env_uses_the_child_env_allowlist_and_keeps_proxy_route() {
+        let parent = [
+            ("HTTPS_PROXY", "http://fleet:pass@proxy.example.test:8080"),
+            ("no_proxy", "localhost"),
+            ("SSL_CERT_FILE", "/etc/ssl/corp.pem"),
+            ("CURL_CA_BUNDLE", "/etc/ssl/corp.pem"),
+            ("REQUESTS_CA_BUNDLE", "/etc/ssl/corp.pem"),
+            ("NODE_EXTRA_CA_CERTS", "/etc/ssl/corp.pem"),
+            ("PATHEXT", ".COM;.EXE;.BAT"),
+            ("WINDIR", "C:\\Windows"),
+            ("ProgramFiles", "C:\\Program Files"),
+            ("USERPROFILE", "C:\\Users\\fleet"),
+            ("TEMP", "C:\\Temp"),
+            ("USER", "fleet"),
+            ("TERM", "xterm-256color"),
+            ("CARGO_HOME", "/home/fleet/.cargo"),
+            ("CARGO_TARGET_DIR", "/tmp/target"),
+            ("DEEPSEEK_API_KEY", "secret"),
+            ("GITHUB_TOKEN", "secret"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("CARGO_REGISTRY_TOKEN", "secret"),
+            ("DATABASE_URL", "postgres://u:secret@db/app"),
+            ("CODEWHALE_TELEMETRY", "true"),
+        ];
+        let env = base_env_from(parent);
+        for (key, value) in &parent[..15] {
+            assert_eq!(
+                env.get(*key).map(String::as_str),
+                Some(*value),
+                "{key} must reach the worker unchanged"
+            );
+        }
+        for key in [
+            "DEEPSEEK_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "CARGO_REGISTRY_TOKEN",
+            "DATABASE_URL",
+        ] {
+            assert!(!env.contains_key(key), "{key} must not reach the worker");
+        }
+        assert_eq!(
+            env.get("CODEWHALE_TELEMETRY").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn runtime_surface_hardening_ssh_requires_known_host_verification() {
+        let tmp = TempDir::new().unwrap();
+        let request = FleetWorkerStartRequest::new(
+            "ssh-1",
+            FleetWorkerCommand::new("codewhale", ["fleet-worker"]),
+        );
+        for known_hosts in [None, Some(PathBuf::from("/tmp/fleet keys/known_hosts"))] {
+            let mut config = SshFleetHostConfig::new("builder.example.test", "/srv/codewhale");
+            config.known_hosts = known_hosts.clone();
+            let adapter = SshFleetHostAdapter::new(tmp.path(), config).unwrap();
+            let command = adapter.build_ssh_command(&request).unwrap();
+            assert!(
+                command
+                    .args
+                    .contains(&"StrictHostKeyChecking=yes".to_string())
+            );
+            if let Some(path) = known_hosts {
+                assert!(
+                    command
+                        .args
+                        .contains(&format!("UserKnownHostsFile=\"{}\"", path.display()))
+                );
+                assert!(
+                    command
+                        .args
+                        .contains(&"GlobalKnownHostsFile=none".to_string())
+                );
+                let ignore = command
+                    .args
+                    .iter()
+                    .position(|arg| arg == "IgnoreUnknown=KnownHostsCommand")
+                    .expect("OpenSSH 7.x must ignore the newer KnownHostsCommand option");
+                let command_option = command
+                    .args
+                    .iter()
+                    .position(|arg| arg == "KnownHostsCommand=none")
+                    .expect("disable additional known-host sources on newer clients");
+                assert!(
+                    ignore < command_option,
+                    "IgnoreUnknown applies only to later options"
+                );
+                assert!(command.args.contains(&"VerifyHostKeyDNS=no".to_string()));
+            }
+        }
+        let mut config = SshFleetHostConfig::new("builder.example.test", "/srv/codewhale");
+        config.host_key_fingerprint = Some("SHA256:configured-pin".to_string());
+        let err = SshFleetHostAdapter::new(tmp.path(), config).unwrap_err();
+        assert_eq!(err.kind, FleetHostErrorKind::Configuration);
+        assert!(err.message.contains("configure known_hosts"));
+    }
+
+    #[test]
+    fn runtime_surface_review_documented_ssh_host_loads() {
+        // Windows checkouts may carry CRLF line endings.
+        let docs = include_str!("../../../../docs/zh_hans/FLEET.md").replace("\r\n", "\n");
+        let example = docs
+            .split_once("### Worker 认证")
+            .expect("worker authentication guidance")
+            .1
+            .split("```json\n")
+            .skip(1)
+            .filter_map(|block| {
+                serde_json::from_str::<serde_json::Value>(block.split("```").next()?).ok()
+            })
+            .find(|value| value["id"] == "builder-1")
+            .expect("documented SSH worker example");
+        let host: FleetHostSpec = serde_json::from_value(example["host"].clone()).unwrap();
+        let config = SshFleetHostConfig::from_host_spec(&host)
+            .expect("documented host must load without migration errors");
+        assert!(config.known_hosts.is_some());
     }
 
     #[test]

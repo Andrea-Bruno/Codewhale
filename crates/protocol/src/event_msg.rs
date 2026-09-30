@@ -400,6 +400,15 @@ pub enum EventMsg {
         session_id: SessionId,
         snapshot: Value,
     },
+    /// A workspace snapshot the engine took for the running turn
+    /// (`WorkspaceSnapshotRef` serialized: `kind`, `snapshot_id`, `tree_id`,
+    /// `session_id`, optional `tool_call_id`, `write_paths` and
+    /// `changed_paths`).
+    WorkspaceSnapshotTaken {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        snapshot: Value,
+    },
     /// Immutable billing route captured at application admission.
     RouteDispatched {
         thread_id: ThreadId,
@@ -549,6 +558,10 @@ pub enum EventMsg {
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route_source: Option<String>,
+        /// The name the agent goes by (workflow task label, dispatch name, or
+        /// role). Absent from older producers; never the raw id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     AgentProgress {
         thread_id: ThreadId,
@@ -575,6 +588,8 @@ pub enum EventMsg {
         spawn_depth: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continuable: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     SubAgentFollowUp {
         thread_id: ThreadId,
@@ -773,6 +788,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "operation_activity_completed",
     "turn_started",
     "tool_request_snapshot",
+    "workspace_snapshot_taken",
     "route_dispatched",
     "turn_complete",
     "turn_usage",
@@ -828,6 +844,7 @@ impl EventMsg {
             Self::OperationActivityCompleted { .. } => "operation_activity_completed",
             Self::TurnStarted { .. } => "turn_started",
             Self::ToolRequestSnapshot { .. } => "tool_request_snapshot",
+            Self::WorkspaceSnapshotTaken { .. } => "workspace_snapshot_taken",
             Self::RouteDispatched { .. } => "route_dispatched",
             Self::TurnComplete { .. } => "turn_complete",
             Self::TurnUsage { .. } => "turn_usage",
@@ -883,6 +900,7 @@ impl EventMsg {
             | Self::OperationActivityCompleted { thread_id, .. }
             | Self::TurnStarted { thread_id, .. }
             | Self::ToolRequestSnapshot { thread_id, .. }
+            | Self::WorkspaceSnapshotTaken { thread_id, .. }
             | Self::RouteDispatched { thread_id, .. }
             | Self::TurnComplete { thread_id, .. }
             | Self::TurnUsage { thread_id, .. }
@@ -938,6 +956,7 @@ impl EventMsg {
             | Self::OperationActivityCompleted { session_id, .. }
             | Self::TurnStarted { session_id, .. }
             | Self::ToolRequestSnapshot { session_id, .. }
+            | Self::WorkspaceSnapshotTaken { session_id, .. }
             | Self::RouteDispatched { session_id, .. }
             | Self::TurnComplete { session_id, .. }
             | Self::TurnUsage { session_id, .. }
@@ -1100,6 +1119,11 @@ mod tests {
                 session_id: s.clone(),
                 snapshot: json!({"tool_count": 2}),
             },
+            EventMsg::WorkspaceSnapshotTaken {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                snapshot: json!({"kind": "pre_turn", "tree_id": "t"}),
+            },
             EventMsg::RouteDispatched {
                 thread_id: t.clone(),
                 session_id: s.clone(),
@@ -1212,6 +1236,7 @@ mod tests {
                 spawn_depth: 1,
                 model: "m".into(),
                 route_source: Some("task.model".into()),
+                display_name: Some("audit docs".into()),
             },
             EventMsg::AgentProgress {
                 thread_id: t.clone(),
@@ -1237,6 +1262,7 @@ mod tests {
                 parent_run_id: None,
                 spawn_depth: Some(1),
                 continuable: Some(false),
+                display_name: Some("audit docs".into()),
             },
             EventMsg::SubAgentFollowUp {
                 thread_id: t.clone(),
@@ -1453,6 +1479,36 @@ mod tests {
             assert_eq!(value["session_id"], msg.session_id().to_string(), "{msg:?}");
             let back: EventMsg = serde_json::from_value(value).unwrap();
             assert_eq!(back, msg);
+        }
+    }
+
+    #[test]
+    fn agent_events_from_producers_without_a_display_name_still_load() {
+        // #6565 added `display_name`; payloads written before it omit it.
+        let mut every = every_variant();
+        every.retain(|msg| {
+            matches!(
+                msg,
+                EventMsg::AgentSpawned { .. } | EventMsg::AgentComplete { .. }
+            )
+        });
+        assert_eq!(every.len(), 2);
+        for msg in every {
+            let mut value = serde_json::to_value(&msg).unwrap();
+            assert_eq!(value["display_name"], "audit docs");
+            value.as_object_mut().unwrap().remove("display_name");
+            let back: EventMsg = serde_json::from_value(value.clone()).unwrap();
+            match &back {
+                EventMsg::AgentSpawned { display_name, .. }
+                | EventMsg::AgentComplete { display_name, .. } => assert_eq!(*display_name, None),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(
+                serde_json::to_value(&back)
+                    .unwrap()
+                    .get("display_name")
+                    .is_none()
+            );
         }
     }
 

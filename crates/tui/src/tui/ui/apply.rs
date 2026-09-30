@@ -201,6 +201,10 @@ pub(crate) fn apply_engine_error_to_app(
     // An idle or locally cancelled turn must never be reactivated by an error.
     let turn_remains_active =
         recoverable && turn_was_in_progress && !app.suppress_stream_events_until_turn_complete;
+    // The engine decides whether the question was taken back out of the
+    // session; the host only follows, so the two cannot disagree (#6566).
+    let credential_rejected_before_output = turn_was_in_progress
+        && envelope.code == crate::error_taxonomy::CREDENTIAL_REJECTED_UNSENT_CODE;
     streaming_thinking::finalize_current(app);
     if turn_was_in_progress {
         app.finalize_streaming_assistant_as_interrupted();
@@ -212,6 +216,14 @@ pub(crate) fn apply_engine_error_to_app(
     app.streaming_state.reset();
     app.streaming_message_index = None;
     app.streaming_thinking_active_entry = None;
+    // Before the error line lands, so the question's bubble is still the last
+    // cell and can come out with it. A draft the person already started in
+    // the composer is left alone, and so is the bubble that holds their text.
+    let unsent_message = if credential_rejected_before_output && app.input.is_empty() {
+        take_back_unsent_submission(app)
+    } else {
+        None
+    };
 
     // #455 (observer-only): fire `on_error` hooks so operators can
     // page on auth / billing / invalid-request failures without
@@ -237,6 +249,23 @@ pub(crate) fn apply_engine_error_to_app(
         app.dispatch_started_at = None;
     }
     app.turn_error_posted = true;
+    app.turn_error_notice = Some(message.clone());
+    if credential_rejected_before_output {
+        // #6566: the provider refused the key before any model output, so the
+        // engine takes the question back out of the session. Give it back to
+        // the person with the one next step, instead of an error with no way
+        // forward and a message they must retype. The whole message comes
+        // back, a skill it invoked included.
+        match unsent_message {
+            Some(message) => app.restore_unsent_message(message),
+            None => {
+                app.restore_last_submitted_prompt_if_empty();
+            }
+        }
+        app.add_message(HistoryCell::System {
+            content: app.tr(MessageId::AuthRejectedRecovery).into_owned(),
+        });
+    }
     if matches!(
         envelope.category,
         crate::error_taxonomy::ErrorCategory::Authentication
@@ -1291,6 +1320,25 @@ pub(crate) async fn apply_command_result(
     config: &mut Config,
     result: commands::CommandResult,
 ) -> Result<bool> {
+    let outcome =
+        apply_command_result_inner(terminal, app, engine_handle, task_manager, config, result)
+            .await;
+    // A save the command made may have moved legacy top-level `base_url` /
+    // `api_key` into their provider tables (#6394); say so once.
+    for notice in codewhale_config::legacy_root::take_notices() {
+        app.push_status_toast(notice, StatusToastLevel::Info, Some(10_000));
+    }
+    outcome
+}
+
+async fn apply_command_result_inner(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    task_manager: &SharedTaskManager,
+    config: &mut Config,
+    result: commands::CommandResult,
+) -> Result<bool> {
     // These two actions await participant inference inline on the UI event
     // loop. Waiting behind Runtime Chat's exclusive writer here would
     // deadlock: this same loop must drain the terminal projection/server
@@ -1519,6 +1567,43 @@ pub(crate) async fn apply_command_result(
                     persist_full_reset_snapshot(app);
                 }
             }
+            AppAction::SetWorkspaceTrust { trusted, save } => {
+                let result = crate::commands::set_workspace_trust(app, trusted, save).await;
+                sync_mode_update(app, engine_handle).await;
+                match result {
+                    Ok(()) => {
+                        app.push_status_toast(
+                            format!(
+                                "/trust: {} ({})",
+                                tr(
+                                    app.ui_locale,
+                                    if trusted {
+                                        MessageId::ConfigValueOn
+                                    } else {
+                                        MessageId::ConfigValueOff
+                                    }
+                                ),
+                                tr(
+                                    app.ui_locale,
+                                    if save {
+                                        MessageId::ConfigScopeSaved
+                                    } else {
+                                        MessageId::ConfigScopeSession
+                                    }
+                                ),
+                            ),
+                            StatusToastLevel::Info,
+                            None,
+                        );
+                    }
+                    Err(error) => app.push_status_toast(
+                        tr(app.ui_locale, MessageId::AutomationEditorSaveFailed)
+                            .replace("{error}", &format!("/trust: {error:#}")),
+                        StatusToastLevel::Error,
+                        None,
+                    ),
+                }
+            }
             AppAction::ModeChanged(_mode) => {
                 sync_mode_update(app, engine_handle).await;
             }
@@ -1544,6 +1629,9 @@ pub(crate) async fn apply_command_result(
                 }
             }
             AppAction::PluginRegistryChanged => {
+                // Revoke a disabled or untrusted plugin's host code now, not at
+                // the next turn's rebuild.
+                crate::extension_host::plugins_changed(std::sync::Arc::clone(&app.plugin_registry));
                 let command_errors = crate::commands::user_registry::install_plugin_registry(
                     &app.workspace,
                     app.plugin_registry.as_ref(),
@@ -2187,10 +2275,7 @@ pub(crate) async fn apply_command_result(
                 }
             }
             AppAction::OpenWorkflowsManager => {
-                if app.view_stack.top_kind() != Some(ModalKind::WorkflowsManager) {
-                    app.view_stack
-                        .push(crate::tui::views::workflows_manager::WorkflowsManagerView::new(app));
-                }
+                crate::tui::views::workflows_manager::open(app);
             }
             AppAction::OpenExtensions { tab } => {
                 if app.view_stack.top_kind() != Some(ModalKind::Extensions) {
@@ -2514,21 +2599,14 @@ pub(crate) async fn apply_command_result(
                     }
                 }
             }
-            AppAction::ShareSession {
-                history_len: _,
-                model,
-                mode,
-            } => {
-                let status = if app.api_messages.is_empty() {
-                    "No session content to share.".to_string()
-                } else {
-                    let history_json = serde_json::to_string_pretty(&app.api_messages)
-                        .unwrap_or_else(|_| "[]".to_string());
-                    match crate::commands::share::perform_share(&history_json, &model, &mode).await
-                    {
-                        Ok(url) => format!("Session shared! URL: {url}"),
-                        Err(err) => format!("Share failed: {err}"),
+            AppAction::ShareSession { html } => {
+                // The page was rendered and redacted by `/share confirm`
+                // through the `/export` projection; only upload happens here.
+                let status = match crate::commands::share::perform_share(html).await {
+                    Ok(url) => {
+                        format!("Session shared as a secret gist (unlisted, not private): {url}")
                     }
+                    Err(err) => format!("Share failed: {err}"),
                 };
                 app.add_message(HistoryCell::System {
                     content: status.clone(),
@@ -3148,6 +3226,23 @@ pub(crate) async fn apply_provider_picker_test_connection(
     .await;
 }
 
+/// One plain sentence for a key the provider did not accept, with the next
+/// step, in place of the provider's raw reply (#6566). Only a failure with no
+/// plain reading keeps a sanitized, bounded excerpt of that reply.
+fn plain_key_verification_error(app: &App, reason: &str, api_key: &str) -> String {
+    use crate::error_taxonomy::ErrorCategory;
+    match provider_verification_error_category(reason) {
+        ErrorCategory::Authentication => app.tr(MessageId::ProviderKeyRejected).into_owned(),
+        ErrorCategory::Authorization => app.tr(MessageId::ProviderKeyForbidden).into_owned(),
+        ErrorCategory::Network | ErrorCategory::Timeout => {
+            app.tr(MessageId::ProviderKeyUnreachable).into_owned()
+        }
+        _ => app
+            .tr(MessageId::ProviderKeyCheckFailed)
+            .replace("{reason}", &sanitize_probe_status(reason, api_key)),
+    }
+}
+
 fn sanitize_probe_status(reason: &str, api_key: &str) -> String {
     let mut text = reason.to_string();
     if let Some(rest) = reason.strip_prefix("HTTP ")
@@ -3322,8 +3417,9 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
                 );
             } else {
                 app.status_message = Some(format!(
-                    "{} connection checked (/models returned 2xx), but the guided setup could not be re-opened.",
-                    provider.as_str()
+                    "{} {}",
+                    app.tr(MessageId::ProviderConnectionChecked),
+                    app.tr(MessageId::ProviderPickerNotReopened)
                 ));
             }
             app.needs_redraw = true;
@@ -3334,10 +3430,13 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
             // the key instead of dead-ending with a status toast. Name the
             // endpoint the probe actually used: a 401 from the wrong host
             // (a legacy root `base_url` leaking into this route, say) is
-            // otherwise indistinguishable from a bad key.
+            // otherwise indistinguishable from a bad key. The provider's raw
+            // reply (often truncated JSON) is not the message: say what went
+            // wrong and what to do next in plain words (#6566).
+            let plain = plain_key_verification_error(app, &reason, &api_key);
             let reason = match crate::llm_client::base_url_authority(&base_url) {
-                Some(authority) => format!("{reason} (endpoint: {authority})"),
-                None => reason,
+                Some(authority) => format!("{plain} ({authority})"),
+                None => plain.clone(),
             };
             let runtime_status = query_provider_runtime_status(engine_handle).await;
             if let Some(picker) =
@@ -3355,14 +3454,11 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
                 })
             {
                 app.view_stack.push(picker);
-                app.status_message = Some(format!(
-                    "{} API key verification failed - check the key and try again.",
-                    provider.as_str()
-                ));
+                app.status_message = Some(plain);
             } else {
                 app.status_message = Some(format!(
-                    "{} API key verification failed, but the provider could not be re-opened.",
-                    provider.as_str()
+                    "{plain} {}",
+                    app.tr(MessageId::ProviderPickerNotReopened)
                 ));
             }
             app.needs_redraw = true;
@@ -3696,10 +3792,23 @@ pub(crate) fn apply_loaded_session_with_goal(
         // is contended, the current conversation stays intact and a retry can
         // use this durably repaired binding to the same host.
         let mut recovered = session.clone();
-        recovered.metadata.runtime_store = Some(binding.clone());
-        SessionManager::default_location()
-            .and_then(|manager| manager.save_session(&recovered))
+        let abandoned = recovered.metadata.runtime_store.replace(binding.clone());
+        let manager = SessionManager::default_location()
             .map_err(|error| format!("Session recovery could not be saved: {error}"))?;
+        manager
+            .save_session(&recovered)
+            .map_err(|error| format!("Session recovery could not be saved: {error}"))?;
+        // The conversation now lives in this host's store. The empty store it
+        // left is set aside here, where it is abandoned, unless another
+        // document still binds it (#6144 P1a) — otherwise it stayed on disk
+        // with nothing pointing at it.
+        if let Some(abandoned) = abandoned {
+            crate::session_reconcile::retire_unbound_store_in_background(
+                manager,
+                abandoned.data_dir,
+                "conversation rebound to another host's store",
+            );
+        }
     }
     app.restore_work_state(
         &session.metadata.id,
@@ -3728,6 +3837,20 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.last_exec_wait_command = None;
     let messages = app.api_messages.clone();
     let mut message_to_cell = std::collections::HashMap::new();
+    // Failed-turn notices are replayed where they happened: after the
+    // messages that existed when the turn ended (clamped to the transcript).
+    let mut turn_outcomes = session.turn_outcomes.iter().peekable();
+    let mut replay_outcomes_through = |app: &mut App, message_count: usize, last: bool| {
+        while let Some(outcome) =
+            turn_outcomes.next_if(|outcome| last || outcome.after_message_count <= message_count)
+        {
+            app.extend_history(std::iter::once(HistoryCell::Error {
+                message: outcome.error.clone(),
+                severity: crate::error_taxonomy::ErrorSeverity::Warning,
+            }));
+        }
+    };
+    replay_outcomes_through(app, 0, messages.is_empty());
     for (message_index, msg) in messages.iter().enumerate() {
         let mut cells = history_cells_from_message(msg);
         if msg.role == "user"
@@ -3751,6 +3874,7 @@ pub(crate) fn apply_loaded_session_with_goal(
             message_to_cell.insert(message_index, base + offset);
         }
         app.extend_history(cells);
+        replay_outcomes_through(app, message_index + 1, message_index + 1 == messages.len());
     }
     app.rebuild_completed_assistant_outputs_from_restored_history();
     app.sync_context_references_from_session(&session.context_references, &message_to_cell);
@@ -3899,6 +4023,7 @@ pub(crate) fn apply_loaded_session_with_goal(
         );
     }
     app.session_artifacts = session.artifacts;
+    app.session_turn_outcomes = session.turn_outcomes;
     app.window_title = session.window_title;
     app.workspace_context = None;
     app.workspace_is_linked_worktree = false;
@@ -3958,7 +4083,7 @@ mod profile_snapshot_tests {
             "../../../../config/tests/fixtures/custom_models.toml"
         ))
         .expect("profile fixture");
-        config.api_key = Some("profile-snapshot-local-fixture".to_string());
+        config.set_legacy_root(Some("profile-snapshot-local-fixture".to_string()), None);
         config.default_text_model = Some(model.to_string());
         config.providers.as_mut().unwrap().deepseek.base_url = Some(base_url.to_string());
         let declaration = &mut config.custom_models.as_mut().unwrap()[0];

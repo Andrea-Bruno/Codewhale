@@ -120,6 +120,13 @@ impl Locale {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageId {
+    MobileStreamReplayFailed,
+    MobileStreamCatchUpFailed,
+    MobileStreamRuntimeShutdown,
+    MobileStreamEnded,
+    MobileStreamClosed,
+    MobileStreamReconnecting,
+    MobileStreamConnected,
     SessionArchiveExported,
     SessionArchiveSizes,
     SessionArchiveNoArtifacts,
@@ -489,6 +496,7 @@ pub enum MessageId {
     CmdConstitutionDescription,
     CmdContextDescription,
     CmdCostDescription,
+    CmdReceiptsDescription,
     CmdDiffDescription,
     CmdEditDescription,
     CmdExitDescription,
@@ -624,6 +632,7 @@ pub enum MessageId {
     ExtensionsStateInapplicable,
     ExtensionsStateInvalid,
     ExtensionsStateNotInspected,
+    ExtensionsStateDisconnected,
     ExtensionsStateRejected,
     ExtensionsStateReviewedCandidate,
     ExtensionsStateUnderEvaluation,
@@ -699,6 +708,13 @@ pub enum MessageId {
     PluginSuggestionReason,
     PagerActionConfirm,
     CmdPluginBundleDetail,
+    CmdPluginOwnerReport,
+    CmdPluginOwnerActivating,
+    CmdPluginOwnerActive,
+    CmdPluginOwnerFailed,
+    CmdPluginOwnerFaulted,
+    CmdPluginOwnerRevoked,
+    CmdPluginOwnerInactive,
     CmdPluginBundleDiagnosticsHeader,
     CmdPluginBundleMutationSuccess,
     CmdPluginActionFailed,
@@ -875,6 +891,10 @@ pub enum MessageId {
     CmdCacheFootnote,
     CmdCacheHeader,
     CmdCacheNoData,
+    CmdCacheSessionRates,
+    CmdCacheRateParent,
+    CmdCacheRateAgents,
+    CmdCacheRateCombined,
     CmdCacheTotals,
     CmdCostReport,
     CmdCostReportSubtotal,
@@ -966,6 +986,16 @@ pub enum MessageId {
     KbPasteAttach,
     KbCopySelection,
     ClipboardSshPasteHint,
+    /// Copy receipt when a native clipboard confirmed the write.
+    ClipboardCopied,
+    /// Copy receipt when the text went to the terminal (OSC 52 / tmux),
+    /// which never acknowledges it.
+    ClipboardSentToTerminal,
+    /// Cut when only the terminal took the copy: the text is kept, because
+    /// the terminal never confirms it.
+    ClipboardCutKeptText,
+    /// Paste found nothing: the clipboard read came back empty or failed.
+    ClipboardNothingToPaste,
     KbContextMenu,
     KbPointerScroll,
     KbPointerClick,
@@ -1347,6 +1377,23 @@ pub enum MessageId {
     CtxMenuWindowUnpin,
     /// Right-click menu: description for the window-pin entry.
     CtxMenuWindowPinDesc,
+    /// Right-click menu: a work-surface row's own command, `{command}`.
+    CtxMenuRunCommand,
+    CtxMenuOpen,
+    /// Right-click menu on an agent row: the one agent destination.
+    CtxMenuFocusAgent,
+    CtxMenuFocusAgentDesc,
+    CtxMenuCopyId,
+    CtxMenuCopyRow,
+    CtxMenuStopAgent,
+    /// Right-click menu: stop a work item (job, task, workflow run).
+    CtxMenuStopWork,
+    /// Right-click menu: label an armed destructive row shows until the
+    /// second activation runs it.
+    CtxMenuConfirmArmed,
+    /// Open in editor refused at launch: `{path}` is no longer a regular
+    /// file inside the workspace reached without links.
+    CtxMenuEditorRefused,
     /// `/pin` command description (always-on-top mini-window toggle).
     CmdPinDescription,
     /// Status toast: host window is now the always-on-top mini window.
@@ -1541,6 +1588,28 @@ pub enum MessageId {
     NotificationSubagentInterrupted,
     NotificationSubagentCancelled,
     NotificationSubagentBudgetExhausted,
+    NotificationShellFinished,
+    NotificationShellFailed,
+    NotificationShellStopped,
+    NotificationTaskFinished,
+    NotificationTaskFailed,
+    NotificationTaskStopped,
+    NotificationBackgroundFinished,
+    NotificationBackgroundMixed,
+    BackgroundFinishedHeading,
+    BackgroundFinishedHint,
+    BackgroundOutcomeDone,
+    BackgroundOutcomeFailed,
+    BackgroundOutcomeCancelled,
+    BackgroundOutcomeKilled,
+    BackgroundOutcomeTimedOut,
+    BackgroundExitCode,
+    BackgroundQuiet,
+    BackgroundUsingTool,
+    BackgroundStep,
+    BackgroundFilesChanged,
+    NotificationBackgroundStopped,
+    NotificationFullResultPointer,
     // Footer chips.
     FooterWorkedChip,
     FooterPermissionKeyHint,
@@ -1696,6 +1765,16 @@ pub enum MessageId {
     LaunchNoRecentSessions,
     LaunchResumeFailed,
     LaunchNoModelConnected,
+    DispatchNotSentNoModel,
+    DispatchNotSentSaveKey,
+    DispatchNotSentStatus,
+    AuthRejectedRecovery,
+    ProviderKeyRejected,
+    ProviderKeyForbidden,
+    ProviderKeyUnreachable,
+    ProviderKeyCheckFailed,
+    LocalModelAdopted,
+    ProviderPickerNotReopened,
     LaunchRunCommand,
     LaunchMcpConnectedOne,
     LaunchMcpConnectedMany,
@@ -1987,6 +2066,8 @@ pub enum MessageId {
     SnapshotsDisabledTooLarge,
     SnapshotsDisabledTooManyFiles,
     SnapshotsDisabledUnsafeLocation,
+    SnapshotsHistoryRepaired,
+    SnapshotsFailing,
     SessionIdDivergedNotice,
     RuntimeStoreUnreadableNotice,
     RuntimeStoreUnwritableNotice,
@@ -2345,6 +2426,8 @@ pub enum MessageId {
     AgentFocusPlaceholder,
     AgentFocusNoTranscript,
     AgentFocusOmitted,
+    AgentFocusResult,
+    AgentFocusStopReason,
     AgentFocusFollowUpDelivered,
     AgentFocusFollowUpQueued,
     AgentFocusFollowUpContinued,
@@ -2352,6 +2435,15 @@ pub enum MessageId {
     FooterHintForAgents,
     FooterHintToManage,
     AgentRailQueuedCount,
+    WorkbarSoFar,
+    WorkbarLargeWorkflow,
+    WorkbarMoreRuns,
+    WorkflowLineStarted,
+    WorkflowLineFinished,
+    WorkflowLineFinishedWithGaps,
+    WorkflowLineFailed,
+    WorkflowLineStopped,
+    WorkflowLineAgents,
     PickerActionTestConnection,
     ProviderCustomFormBaseUrl,
     ProviderCustomFormModel,
@@ -2552,6 +2644,10 @@ pub enum MessageId {
     McpShowUnavailableWhileTurnRuns,
     McpLivePoolRefreshDeferredWhileTurnRuns,
     McpRetryDeferredWhileTurnRuns,
+    McpRetryStarted,
+    McpRetryConnected,
+    McpRetryNeedsLogin,
+    McpRetryFailed,
     WorkflowCountRunning,
     WorkflowCountDone,
     WorkflowCountFailed,
@@ -2573,6 +2669,13 @@ pub enum MessageId {
 
 #[allow(dead_code)]
 pub const ALL_MESSAGE_IDS: &[MessageId] = &[
+    MessageId::MobileStreamReplayFailed,
+    MessageId::MobileStreamCatchUpFailed,
+    MessageId::MobileStreamRuntimeShutdown,
+    MessageId::MobileStreamEnded,
+    MessageId::MobileStreamClosed,
+    MessageId::MobileStreamReconnecting,
+    MessageId::MobileStreamConnected,
     MessageId::SessionArchiveExported,
     MessageId::SessionArchiveSizes,
     MessageId::SessionArchiveNoArtifacts,
@@ -2933,6 +3036,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdConstitutionDescription,
     MessageId::CmdContextDescription,
     MessageId::CmdCostDescription,
+    MessageId::CmdReceiptsDescription,
     MessageId::CmdDiffDescription,
     MessageId::CmdEditDescription,
     MessageId::CmdExitDescription,
@@ -3071,6 +3175,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ExtensionsStateInapplicable,
     MessageId::ExtensionsStateInvalid,
     MessageId::ExtensionsStateNotInspected,
+    MessageId::ExtensionsStateDisconnected,
     MessageId::ExtensionsStateRejected,
     MessageId::ExtensionsStateReviewedCandidate,
     MessageId::ExtensionsStateUnderEvaluation,
@@ -3146,6 +3251,13 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::PluginSuggestionReason,
     MessageId::PagerActionConfirm,
     MessageId::CmdPluginBundleDetail,
+    MessageId::CmdPluginOwnerReport,
+    MessageId::CmdPluginOwnerActivating,
+    MessageId::CmdPluginOwnerActive,
+    MessageId::CmdPluginOwnerFailed,
+    MessageId::CmdPluginOwnerFaulted,
+    MessageId::CmdPluginOwnerRevoked,
+    MessageId::CmdPluginOwnerInactive,
     MessageId::CmdPluginBundleDiagnosticsHeader,
     MessageId::CmdPluginBundleMutationSuccess,
     MessageId::CmdPluginActionFailed,
@@ -3318,6 +3430,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdCacheFootnote,
     MessageId::CmdCacheHeader,
     MessageId::CmdCacheNoData,
+    MessageId::CmdCacheSessionRates,
+    MessageId::CmdCacheRateParent,
+    MessageId::CmdCacheRateAgents,
+    MessageId::CmdCacheRateCombined,
     MessageId::CmdCacheTotals,
     MessageId::CmdChangeDescription,
     MessageId::CmdChangeHeader,
@@ -3413,6 +3529,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::KbPasteAttach,
     MessageId::KbCopySelection,
     MessageId::ClipboardSshPasteHint,
+    MessageId::ClipboardCopied,
+    MessageId::ClipboardSentToTerminal,
+    MessageId::ClipboardCutKeptText,
+    MessageId::ClipboardNothingToPaste,
     MessageId::KbContextMenu,
     MessageId::KbPointerScroll,
     MessageId::KbPointerClick,
@@ -3782,6 +3902,16 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CtxMenuWindowPin,
     MessageId::CtxMenuWindowUnpin,
     MessageId::CtxMenuWindowPinDesc,
+    MessageId::CtxMenuRunCommand,
+    MessageId::CtxMenuOpen,
+    MessageId::CtxMenuFocusAgent,
+    MessageId::CtxMenuFocusAgentDesc,
+    MessageId::CtxMenuCopyId,
+    MessageId::CtxMenuCopyRow,
+    MessageId::CtxMenuStopAgent,
+    MessageId::CtxMenuStopWork,
+    MessageId::CtxMenuConfirmArmed,
+    MessageId::CtxMenuEditorRefused,
     MessageId::CmdPinDescription,
     MessageId::WindowPinActive,
     MessageId::WindowPinReleased,
@@ -3958,6 +4088,28 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::NotificationSubagentInterrupted,
     MessageId::NotificationSubagentCancelled,
     MessageId::NotificationSubagentBudgetExhausted,
+    MessageId::NotificationShellFinished,
+    MessageId::NotificationShellFailed,
+    MessageId::NotificationShellStopped,
+    MessageId::NotificationTaskFinished,
+    MessageId::NotificationTaskFailed,
+    MessageId::NotificationTaskStopped,
+    MessageId::NotificationBackgroundFinished,
+    MessageId::NotificationBackgroundMixed,
+    MessageId::BackgroundFinishedHeading,
+    MessageId::BackgroundFinishedHint,
+    MessageId::BackgroundOutcomeDone,
+    MessageId::BackgroundOutcomeFailed,
+    MessageId::BackgroundOutcomeCancelled,
+    MessageId::BackgroundOutcomeKilled,
+    MessageId::BackgroundOutcomeTimedOut,
+    MessageId::BackgroundExitCode,
+    MessageId::BackgroundQuiet,
+    MessageId::BackgroundUsingTool,
+    MessageId::BackgroundStep,
+    MessageId::BackgroundFilesChanged,
+    MessageId::NotificationBackgroundStopped,
+    MessageId::NotificationFullResultPointer,
     MessageId::FooterWorkedChip,
     MessageId::FooterPermissionKeyHint,
     MessageId::ApprovalSummaryRunCommand,
@@ -4095,6 +4247,16 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::LaunchNoRecentSessions,
     MessageId::LaunchResumeFailed,
     MessageId::LaunchNoModelConnected,
+    MessageId::DispatchNotSentNoModel,
+    MessageId::DispatchNotSentSaveKey,
+    MessageId::DispatchNotSentStatus,
+    MessageId::AuthRejectedRecovery,
+    MessageId::ProviderKeyRejected,
+    MessageId::ProviderKeyForbidden,
+    MessageId::ProviderKeyUnreachable,
+    MessageId::ProviderKeyCheckFailed,
+    MessageId::LocalModelAdopted,
+    MessageId::ProviderPickerNotReopened,
     MessageId::LaunchRunCommand,
     MessageId::LaunchMcpConnectedOne,
     MessageId::LaunchMcpConnectedMany,
@@ -4372,6 +4534,8 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SnapshotsDisabledTooLarge,
     MessageId::SnapshotsDisabledTooManyFiles,
     MessageId::SnapshotsDisabledUnsafeLocation,
+    MessageId::SnapshotsHistoryRepaired,
+    MessageId::SnapshotsFailing,
     MessageId::SessionIdDivergedNotice,
     MessageId::RuntimeStoreUnreadableNotice,
     MessageId::RuntimeStoreUnwritableNotice,
@@ -4702,6 +4866,8 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::AgentFocusPlaceholder,
     MessageId::AgentFocusNoTranscript,
     MessageId::AgentFocusOmitted,
+    MessageId::AgentFocusResult,
+    MessageId::AgentFocusStopReason,
     MessageId::AgentFocusFollowUpDelivered,
     MessageId::AgentFocusFollowUpQueued,
     MessageId::AgentFocusFollowUpContinued,
@@ -4709,6 +4875,15 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::FooterHintForAgents,
     MessageId::FooterHintToManage,
     MessageId::AgentRailQueuedCount,
+    MessageId::WorkbarSoFar,
+    MessageId::WorkbarLargeWorkflow,
+    MessageId::WorkbarMoreRuns,
+    MessageId::WorkflowLineStarted,
+    MessageId::WorkflowLineFinished,
+    MessageId::WorkflowLineFinishedWithGaps,
+    MessageId::WorkflowLineFailed,
+    MessageId::WorkflowLineStopped,
+    MessageId::WorkflowLineAgents,
     MessageId::PickerActionTestConnection,
     MessageId::ProviderCustomFormBaseUrl,
     MessageId::ProviderCustomFormModel,
@@ -4906,6 +5081,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::McpShowUnavailableWhileTurnRuns,
     MessageId::McpLivePoolRefreshDeferredWhileTurnRuns,
     MessageId::McpRetryDeferredWhileTurnRuns,
+    MessageId::McpRetryStarted,
+    MessageId::McpRetryConnected,
+    MessageId::McpRetryNeedsLogin,
+    MessageId::McpRetryFailed,
     MessageId::WorkflowCountRunning,
     MessageId::WorkflowCountDone,
     MessageId::WorkflowCountFailed,
@@ -5369,6 +5548,37 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn plugin_owner_report_keeps_translated_state_and_placeholder_parity() {
+        let english = raw_locale_messages(Locale::En);
+        let keys: Vec<_> = english
+            .keys()
+            .filter(|key| key.starts_with("CmdPluginOwner"))
+            .collect();
+        assert_eq!(keys.len(), 7);
+        for locale in Locale::shipped_complete() {
+            let pack = raw_locale_messages(*locale);
+            for key in &keys {
+                let original = english[*key].as_str().unwrap();
+                let translated = pack[*key].as_str().unwrap();
+                assert_eq!(
+                    message_placeholders(translated),
+                    message_placeholders(original),
+                    "{} changed placeholders for {key}",
+                    locale.tag()
+                );
+                if *locale != Locale::En {
+                    assert_ne!(
+                        translated,
+                        original,
+                        "{} left {key} in English",
+                        locale.tag()
+                    );
+                }
+            }
+        }
+    }
+
     /// #5906: the parked-agent vocabulary is new copy on the busiest rows in
     /// the product, so it gets the same hard parity gate coordination copy
     /// has — and the recovery line must keep the tool tokens it names, or it
@@ -5408,6 +5618,37 @@ mod tests {
                 "{} fell back to the English parked recovery line",
                 locale.tag()
             );
+        }
+    }
+
+    #[test]
+    fn background_review_complete_packs_translate_copy_and_preserve_placeholders() {
+        let english = raw_locale_messages(Locale::En);
+        let keys = english
+            .keys()
+            .filter(|key| {
+                key.starts_with("Background") || key.as_str() == "NotificationBackgroundStopped"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 13);
+        for &locale in Locale::shipped_complete() {
+            let pack = raw_locale_messages(locale);
+            for key in &keys {
+                let source = english[*key].as_str().unwrap();
+                let translated = pack
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .expect("translated background key");
+                assert_eq!(
+                    message_placeholders(translated),
+                    message_placeholders(source),
+                    "{} {key}",
+                    locale.tag()
+                );
+                if locale != Locale::En {
+                    assert_ne!(translated, source, "{} {key}", locale.tag());
+                }
+            }
         }
     }
 
@@ -6318,7 +6559,11 @@ mod tests {
             .filter(|key| key.starts_with("Extensions"))
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(keys.len(), 99, "the complete extensions locale set changed");
+        assert_eq!(
+            keys.len(),
+            100,
+            "the complete extensions locale set changed"
+        );
 
         let prose_keys = [
             "ExtensionsMcpEmpty",

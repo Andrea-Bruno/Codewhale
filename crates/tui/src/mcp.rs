@@ -36,7 +36,9 @@ use self::sse::SseTransport;
 use self::stdio::StdioTransport;
 #[cfg(all(test, unix))]
 use self::stdio::{STDIO_SHUTDOWN_GRACE, StderrTail};
-use self::wire::{is_mcp_stale_session_body, is_retriable_mcp_call_error};
+use self::wire::{
+    is_mcp_connection_lost_error, is_mcp_session_rejected_error, is_mcp_stale_session_body,
+};
 use crate::network_policy::{Decision, NetworkPolicyDecider, host_from_url};
 use crate::utils::write_atomic;
 
@@ -1522,12 +1524,19 @@ pub trait McpTransport: Send + Sync {
     /// the default is a no-op.
     fn set_protocol_version(&mut self, _version: &str) {}
 
+    /// The last non-empty line the server wrote to stderr, for naming why a
+    /// handshake was refused. Only stdio children have a stderr; a reviewed
+    /// plugin's is never retained.
+    async fn last_stderr_line(&self) -> Option<String> {
+        None
+    }
+
     /// Synchronous, best-effort liveness probe consulted by
     /// [`McpConnection::is_ready`] so a crashed stdio child stops reading
     /// as "ready" before the next call fails (#6187). Must never block and
     /// never spawn — a contended lock reads as alive; the next call observes
-    /// the death. HTTP/SSE transports have no child to observe, so the
-    /// default is "alive".
+    /// the death. The default is "alive"; Streamable HTTP has no long-lived
+    /// channel to observe, while legacy SSE reports its closed event stream.
     fn probe_dead(&self) -> bool {
         false
     }
@@ -1962,6 +1971,30 @@ impl McpConnection {
         .await?;
 
         let response = self.recv(init_id).await?;
+        if let Some(error) = response.get("error")
+            && self.config.reviewed_plugin.is_none()
+        {
+            // A JSON-RPC error on `initialize` is the server refusing the
+            // handshake, not a transport fault: name the server and what was
+            // launched, and carry the child's last stderr line, which is
+            // usually the real reason (an MCP proxy that cannot reach its
+            // upstream answers -32602 and explains itself only on stderr).
+            let launched = match (&self.config.command, &self.config.url) {
+                (Some(command), _) => format!("command `{}`", mcp_display_target("stdio", command)),
+                (None, Some(_)) => "HTTP endpoint".to_string(),
+                (None, None) => "server".to_string(),
+            };
+            let stderr = self
+                .transport
+                .last_stderr_line()
+                .await
+                .map(|line| format!("; server stderr: {line}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "MCP server '{}' rejected initialize ({launched}): {error}{stderr}",
+                self.name
+            );
+        }
         let result = response_result(
             &response,
             "initialize",
@@ -2531,6 +2564,8 @@ impl McpConnection {
             // IDs, but accept numeric echoes for compatibility with older
             // servers and tests.
             if response_id_matches(value.get("id"), &expected_id) {
+                // Marks the connection stale so it is rebuilt, but this is a
+                // reply to the request, so it never qualifies for a replay.
                 if let Some(error) = value.get("error")
                     && is_mcp_stale_session_body(&error.to_string())
                 {
@@ -2848,6 +2883,19 @@ fn connect_backoff_delay(failures: u32) -> std::time::Duration {
 
 type McpPendingConnect = (String, McpServerConfig);
 type McpConnectError = (String, anyhow::Error);
+
+/// The connected-app server named by an `mcp_<server>_<tool>` tool name.
+/// Presentation only: server names may themselves hold `_`, so this is never
+/// a policy input.
+#[must_use]
+pub fn connected_app_server(tool_name: &str) -> Option<&str> {
+    let rest = tool_name.strip_prefix("mcp_")?;
+    match rest.split_once('_') {
+        Some((server, _)) if !server.is_empty() => Some(server),
+        _ if !rest.is_empty() => Some(rest),
+        _ => None,
+    }
+}
 
 /// Whether an explicit tool selection (`tools_always_load`, a turn's
 /// `allowed_tools`) covers `server`: either an exact `mcp_<server>_<tool>`
@@ -5039,9 +5087,12 @@ impl McpPool {
             Ok(result) => Ok(result),
             // A rejected credential is not a stale session: reconnecting
             // replays the same rejection, so it takes the auth-required
-            // path below instead of the transparent retry.
+            // path below instead of the transparent retry. Only a typed
+            // transport-level refusal of the session id proves the server
+            // never ran the call, so only that class is replayed.
             Err(err)
-                if is_retriable_mcp_call_error(&err) && !oauth::error_looks_auth_required(&err) =>
+                if is_mcp_session_rejected_error(&err)
+                    && !oauth::error_looks_auth_required(&err) =>
             {
                 tracing::debug!(
                     target: "mcp",
@@ -5079,6 +5130,28 @@ impl McpPool {
                         "{err:#}; reconnect failed: {reconnect_err:#}"
                     )),
                 }
+            }
+            // The transport died after the request was written, or the
+            // server answered this request id with a session error: either
+            // way it may already have run the tool, so replaying it could
+            // repeat a side effect. Rebuild the connection for the next call
+            // and let the caller decide whether to repeat this one.
+            Err(err)
+                if is_mcp_connection_lost_error(&err)
+                    && !oauth::error_looks_auth_required(&err) =>
+            {
+                tracing::debug!(
+                    target: "mcp",
+                    server = server_name,
+                    tool = tool_name,
+                    error = %err,
+                    "MCP connection lost during tool call; not retrying"
+                );
+                self.drop_connection(&server_name, "connection lost during tool call");
+                Err(err.context(format!(
+                    "MCP server '{server_name}' connection closed during tool call \
+                     '{tool_name}'; outcome unknown, not retried"
+                )))
             }
             Err(err) => Err(err),
         };
@@ -5291,11 +5364,27 @@ impl McpServerSnapshot {
         }
         mcp_recovery_kind(
             self.enabled,
-            true,
+            self.started(),
             self.connected,
             self.error.as_deref(),
             oauth_capable,
         )
+    }
+
+    /// Whether this session ever attempted the server. Boot is lazy (#6033):
+    /// a configured server nobody asked for has no connection, no recorded
+    /// failure, and no observed capabilities — it was never started, so its
+    /// recovery is `connect`, not `reconnect`, and an OAuth-capable one is
+    /// not yet known to need a login.
+    #[must_use]
+    pub fn started(&self) -> bool {
+        self.connected
+            || self.auth_required
+            || self.error.is_some()
+            || !matches!(
+                self.capability_metadata,
+                McpServerCapabilityMetadata::NotObserved
+            )
     }
 }
 
@@ -5440,6 +5529,12 @@ pub fn load_config(path: &Path) -> Result<McpConfig> {
 const MAX_MCP_CONFIG_BYTES: u64 = 1024 * 1024;
 
 fn read_mcp_config_file(path: &Path) -> Result<Option<String>> {
+    read_bounded_mcp_config_file(path, MAX_MCP_CONFIG_BYTES)
+}
+
+/// [`read_mcp_config_file`] with a caller-chosen size bound, for foreign files
+/// such as `~/.claude.json` that carry far more than an MCP server map.
+fn read_bounded_mcp_config_file(path: &Path, max_bytes: u64) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5456,11 +5551,15 @@ fn read_mcp_config_file(path: &Path) -> Result<Option<String>> {
     let file = open_mcp_config_file(path)
         .with_context(|| format!("Failed to read MCP config {}", path.display()))?;
     let mut contents = String::new();
-    file.take(MAX_MCP_CONFIG_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_string(&mut contents)
         .with_context(|| format!("Failed to read MCP config {}", path.display()))?;
-    if contents.len() as u64 > MAX_MCP_CONFIG_BYTES {
-        anyhow::bail!("MCP config {} exceeds the 1 MiB limit", path.display());
+    if contents.len() as u64 > max_bytes {
+        anyhow::bail!(
+            "MCP config {} exceeds the {} MiB limit",
+            path.display(),
+            max_bytes / (1024 * 1024)
+        );
     }
     Ok(Some(contents))
 }
@@ -5563,6 +5662,72 @@ pub fn resolve_server_scope(global_path: &Path, workspace: &Path, name: &str) ->
         return McpServerScope::Global;
     }
     McpServerScope::Plugin
+}
+
+/// Plugin name of the built-in Computer Use bundle.
+const COMPUTER_USE_PLUGIN_NAME: &str = "computer-use";
+
+/// User-configured servers that launch the same Computer Use plugin as the
+/// enabled built-in `computer-use` bundle, with the argument that gave each
+/// one away. Two copies advertise every Computer Use schema twice (about
+/// 2.5k tokens on every request) and keep two consent ledgers. Diagnostic
+/// only: callers warn and never remove the user's entry.
+pub(crate) fn duplicate_computer_use_servers(config: &McpConfig) -> Vec<(String, String)> {
+    let builtin_enabled = config.servers.values().any(|server| {
+        server.is_enabled()
+            && server
+                .reviewed_plugin
+                .as_ref()
+                .is_some_and(|source| source.plugin_name() == COMPUTER_USE_PLUGIN_NAME)
+    });
+    if !builtin_enabled {
+        return Vec::new();
+    }
+    let mut duplicates = config
+        .servers
+        .iter()
+        .filter(|(_, server)| server.reviewed_plugin.is_none() && server.is_enabled())
+        .filter_map(|(name, server)| {
+            launches_computer_use_plugin(server).map(|arg| (name.clone(), arg))
+        })
+        .collect::<Vec<_>>();
+    duplicates.sort();
+    duplicates
+}
+
+/// The argument naming a Computer Use `mcp/server.mjs`, when this server
+/// runs one: the `plugin.json` next to its `mcp/` directory says
+/// `"name": "computer-use"`, or — when no manifest is readable — the path
+/// has the bundle's shape (`.../computer-use/.../mcp/server.mjs`, any case
+/// or separator).
+fn launches_computer_use_plugin(server: &McpServerConfig) -> Option<String> {
+    server.command.as_ref()?;
+    server.args.iter().find_map(|arg| {
+        let normalized = arg.replace('\\', "/");
+        if !normalized.ends_with("mcp/server.mjs") {
+            return None;
+        }
+        let script = Path::new(arg);
+        let script = if script.is_relative() {
+            server
+                .cwd
+                .as_ref()
+                .map_or_else(|| script.to_path_buf(), |cwd| cwd.join(script))
+        } else {
+            script.to_path_buf()
+        };
+        let root = script.parent().and_then(Path::parent);
+        if let Some(root) = root
+            && let Ok(text) = std::fs::read_to_string(root.join("plugin.json"))
+        {
+            let name = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|manifest| manifest.get("name")?.as_str().map(str::to_string));
+            return (name.as_deref() == Some(COMPUTER_USE_PLUGIN_NAME)).then(|| arg.clone());
+        }
+        let squashed = normalized.to_ascii_lowercase().replace([' ', '-', '_'], "");
+        squashed.contains("computeruse").then(|| arg.clone())
+    })
 }
 
 pub fn load_config_with_workspace(global_path: &Path, workspace: &Path) -> Result<McpConfig> {

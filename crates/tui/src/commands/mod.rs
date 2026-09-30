@@ -48,77 +48,43 @@ mod session_lifecycle_regression_tests;
 
 use std::sync::OnceLock;
 
+pub(crate) use groups::config::config::set_workspace_trust;
 pub use traits::CommandInfo;
 
 // Long-standing public paths that predate the group layout.
 /// `/fleet add` and the picker's ⇧F share these gates; the UI applies them
 /// against the live `Config`.
 pub(crate) use groups::core::fleet::{fleet_catalog_rejection, fleet_provider_rejection};
+pub(crate) use groups::memory::{notes_path, read_notes};
 pub use groups::project::share;
 
 // Voice capture plumbing shared with the hotbar and the UI event loop.
 pub use groups::core::voice;
 
+#[cfg(test)]
+mod debug_diagnostics_baseline_tests;
+// Host fixtures for the eight diagnostics commands live outside the movable
+// debug group; CW-SLICE selects them together with the frozen baseline tests.
+#[cfg(test)]
+mod debug_diagnostics_host_tests;
+#[cfg(test)]
+mod debug_diagnostics_regression_tests;
+#[cfg(test)]
+mod debug_diagnostics_surface_tests;
+#[cfg(test)]
+mod debug_diagnostics_test_support;
+
+#[cfg(test)]
+mod debug_change_host_tests;
+mod debug_group;
+#[cfg(test)]
+mod debug_mutation_host_tests;
+
 use crate::tui::app::{App, AppAction};
 use codewhale_config::AppMode;
 
-/// Result of executing a command
-#[derive(Debug, Clone)]
-pub struct CommandResult {
-    /// Optional message to display to the user
-    pub message: Option<String>,
-    /// Optional action for the app to take
-    pub action: Option<AppAction>,
-    /// Whether the command failed.
-    pub is_error: bool,
-}
-
-impl CommandResult {
-    /// Create an empty result (command succeeded with no output)
-    pub fn ok() -> Self {
-        Self {
-            message: None,
-            action: None,
-            is_error: false,
-        }
-    }
-
-    /// Create a result with just a message
-    pub fn message(msg: impl Into<String>) -> Self {
-        Self {
-            message: Some(msg.into()),
-            action: None,
-            is_error: false,
-        }
-    }
-
-    /// Create a result with an action
-    pub fn action(action: AppAction) -> Self {
-        Self {
-            message: None,
-            action: Some(action),
-            is_error: false,
-        }
-    }
-
-    /// Create a result with both message and action
-    pub fn with_message_and_action(msg: impl Into<String>, action: AppAction) -> Self {
-        Self {
-            message: Some(msg.into()),
-            action: Some(action),
-            is_error: false,
-        }
-    }
-
-    /// Create an error message result
-    pub fn error(msg: impl Into<String>) -> Self {
-        Self {
-            message: Some(format!("Error: {}", msg.into())),
-            action: None,
-            is_error: true,
-        }
-    }
-}
+/// Shared result shape; host actions remain consumed by the existing event loop.
+pub type CommandResult = codewhale_command_contract::outcome::CommandResult<AppAction>;
 
 static REGISTRY: OnceLock<traits::CommandRegistry> = OnceLock::new();
 
@@ -273,6 +239,9 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         .filter(|value| !value.is_empty());
 
     // Check user-defined commands FIRST so they can override built-ins.
+    // Workspace (repository) commands load only in a trusted workspace and
+    // never under a protected built-in such as /trust or /undo — the
+    // registry drops those at load.
     if let Some(result) = user_registry::try_dispatch(app, trimmed) {
         return result;
     }
@@ -548,6 +517,7 @@ mod tests {
     #[test]
     fn user_command_shadows_builtin_before_group_dispatch() {
         let temp = tempdir().unwrap();
+        crate::test_support::trust_workspace(temp.path());
         let commands_dir = temp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
@@ -571,6 +541,7 @@ mod tests {
     #[test]
     fn removed_user_command_reloads_and_falls_back_to_builtin() {
         let temp = tempdir().unwrap();
+        crate::test_support::trust_workspace(temp.path());
         let commands_dir = temp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         let command_path = commands_dir.join("help.md");
@@ -1044,9 +1015,9 @@ mod tests {
                 has_debug = true;
                 assert_eq!(
                     commands.len(),
-                    13,
+                    14,
                     "debug group (group-local metadata exception) expected \
-                     exactly 13 commands, got {}",
+                     exactly 14 commands, got {}",
                     commands.len()
                 );
             }
@@ -1592,6 +1563,8 @@ mod tests {
         let config_path = workspace.join(".deepseek").join("config.toml");
         std::fs::create_dir_all(config_path.parent().expect("config parent")).expect("config dir");
         let guard = ConfigPathGuard::new(&config_path);
+        // Skills live under the workspace here, so they load only once trusted.
+        crate::test_support::trust_workspace(&workspace);
         let options = TuiOptions {
             config_path: Some(config_path),
             skills_dir: workspace.join("skills"),
@@ -2066,10 +2039,10 @@ mod tests {
     }
 
     #[test]
-    fn feat015_all_production_entries_remain_legacy() {
-        // FEAT-015 shipped no production contextual command, so the assertion
-        // below used to exclude nothing. FEAT-018 migrates the utility group;
-        // FEAT-019 migrates the memory group; FEAT-021 migrates the project group.
+    fn feat015_unmigrated_production_entries_remain_legacy() {
+        // FEAT-015 shipped no production contextual command. Later FEATs
+        // register bounded portable groups/slices; every entry outside the
+        // explicit list must still use the original legacy dispatcher.
         const MIGRATED_GROUPS: &[&str] = &[
             // FEAT-018 utility group.
             "attach",
@@ -2114,6 +2087,21 @@ mod tests {
             "title",
             // FEAT-025 session export slice.
             "export",
+            // FEAT-029 complete debug group, including receipts and mutation.
+            "tokens",
+            "cost",
+            "receipts",
+            "balance",
+            "cache",
+            "preview-request",
+            "tools",
+            "change",
+            "system",
+            "context",
+            "edit",
+            "diff",
+            "undo",
+            "retry",
         ];
         for info in command_infos() {
             if info.name == "feat015ctx" || MIGRATED_GROUPS.contains(&info.name) {
@@ -2235,7 +2223,7 @@ mod tests {
         for (name, expected) in [
             ("init", CommandCapabilities::WORKSPACE),
             ("lsp", CommandCapabilities::PROJECT),
-            ("share", CommandCapabilities::PROJECT),
+            ("share", CommandCapabilities::SESSION_EXPORT),
             (
                 "goal",
                 CommandCapabilities::PROJECT.union(CommandCapabilities::PRESENTATION),
@@ -2423,6 +2411,8 @@ mod tests {
     }
 
     fn feat022_test_app(tmp: &tempfile::TempDir) -> App {
+        // The fixture's skills dir lives inside its workspace.
+        crate::test_support::trust_workspace(tmp.path());
         let mut options = crate::test_support::test_tui_options(tmp.path());
         options.skills_dir = tmp.path().join("skills");
         crate::test_support::test_app_with_options(options)
@@ -3033,10 +3023,14 @@ mod tests {
             })
             .map(|command| command.info().name)
             .collect();
+        // `/share` publishes the same redacted projection `/export` renders,
+        // so it holds the same authority and nothing more.
+        let mut export_declarers = export_declarers;
+        export_declarers.sort_unstable();
         assert_eq!(
             export_declarers,
-            vec!["export"],
-            "exactly one registration may declare SESSION_EXPORT"
+            vec!["export", "share"],
+            "only /export and /share may declare SESSION_EXPORT"
         );
 
         // The legacy function registration was removed for export only: the

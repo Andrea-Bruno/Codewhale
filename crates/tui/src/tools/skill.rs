@@ -417,6 +417,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let missing = tmp.path().join("delegate").join("SKILL.md");
         let skill = Skill {
+            legacy_activation_name: None,
             name: "delegate".to_string(),
             description: "delegate work".to_string(),
             localized_descriptions: std::collections::HashMap::new(),
@@ -472,6 +473,7 @@ mod tests {
         fs::write(&skill_path, "changed on disk").unwrap();
         fs::write(tmp.path().join("companion.txt"), "changed companion").unwrap();
         let skill = Skill {
+            legacy_activation_name: None,
             name: "demo:hello".to_string(),
             description: "hello".to_string(),
             localized_descriptions: std::collections::HashMap::new(),
@@ -605,6 +607,7 @@ mod tests {
         let _cw_home =
             crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cw-home"));
         let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
         let skills_dir = workspace.join(".codewhale").join("skills");
         write_skill(&skills_dir, "alpha-skill", "First demo skill", "Body A.");
         write_skill(&skills_dir, "beta-skill", "", "Body B.");
@@ -662,6 +665,7 @@ mod tests {
     async fn execute_finds_skills_in_opencode_dir_via_workspace_discovery() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
         // Skill installed under workspace `.opencode/skills` (#432).
         let opencode_dir = workspace.join(".opencode").join("skills");
         std::fs::create_dir_all(&opencode_dir).unwrap();
@@ -712,6 +716,7 @@ mod tests {
     async fn execute_respects_codewhale_only_skill_discovery() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
         write_skill(
             &workspace.join(".claude").join("skills"),
             "claude-only",
@@ -790,6 +795,7 @@ mod tests {
     async fn execute_returns_helpful_error_for_unknown_skill() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
         // One real skill so the available list is non-empty.
         write_skill(
             &workspace.join(".agents").join("skills"),

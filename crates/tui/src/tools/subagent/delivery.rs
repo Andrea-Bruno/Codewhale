@@ -208,19 +208,10 @@ impl DeliveryEvidence {
         let mut candidates = status_paths(&baseline.root)?;
         candidates.extend(baseline.dirty.keys().cloned());
         if let Some(head) = baseline.head.as_deref() {
-            let output = git(
-                &baseline.root,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--name-only",
-                    "-z",
-                    head,
-                    "HEAD",
-                    "--",
-                ],
-            )?;
+            let mut args = vec!["diff"];
+            args.extend(crate::dependencies::Git::REVIEW_DIFF_ARGS);
+            args.extend(["--name-only", "-z", head, "HEAD", "--"]);
+            let output = git(&baseline.root, &args)?;
             for path in output
                 .split(|byte| *byte == 0)
                 .filter(|path| !path.is_empty())
@@ -390,7 +381,7 @@ pub(super) fn declared_paths(
         if path == "."
             || path
                 .split('/')
-                .any(|part| part.eq_ignore_ascii_case(".git"))
+                .any(|part| crate::snapshot::is_git_metadata_name(std::ffi::OsStr::new(part)))
         {
             return Err("deliverables must name files outside git metadata".into());
         }
@@ -627,6 +618,9 @@ pub(super) struct DeliveryVerificationInputs {
     pub write_perm: bool,
     pub deliverables: Vec<String>,
     pub allowed: Vec<bool>,
+    /// The worker ran in its own isolated worktree and settled in a state that
+    /// cannot be resumed there; remove the worktree if it changed nothing.
+    pub remove_worktree_if_unchanged: bool,
 }
 
 /// Pure compute half of worker delivery verification: the git trio +

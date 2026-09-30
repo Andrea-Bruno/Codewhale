@@ -296,20 +296,6 @@ impl SkillRootCatalog {
                 "registry-cache",
                 false,
             );
-        } else {
-            // Match legacy fallback when HOME is unavailable.
-            push_descriptor(
-                &mut roots,
-                &mut precedence,
-                SkillRootKind::CodeWhaleGlobal,
-                SkillRootAccess::WritableOwned,
-                SkillScope::Global,
-                PathBuf::from("/tmp/codewhale/skills"),
-                true,
-                true,
-                "global-codewhale-fallback",
-                true,
-            );
         }
 
         if let Some(configured) = configured_skills_dir {
@@ -330,9 +316,20 @@ impl SkillRootCatalog {
     ) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
+        // Repository-supplied skills are instructions the user never
+        // reviewed; they load only once the workspace is trusted. Resolved
+        // lazily so a workspace without project skill dirs never reads config.
+        let mut workspace_trusted = None;
 
         for root in &self.roots {
             if !root.active_for_runtime {
+                continue;
+            }
+            if root.scope == SkillScope::Project
+                && path_is_existing_dir(&root.path)
+                && !*workspace_trusted
+                    .get_or_insert_with(|| crate::config::is_workspace_trusted(workspace))
+            {
                 continue;
             }
             match mode {
@@ -406,6 +403,49 @@ impl SkillRootCatalog {
             })
             .collect()
     }
+}
+
+/// Project skill directories that exist but were not loaded because the
+/// workspace is not trusted, so discovery can say so instead of dropping them
+/// silently.
+#[must_use]
+pub fn untrusted_project_skill_dirs(
+    workspace: &Path,
+    home_dir: Option<&Path>,
+    configured_skills_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let catalog = SkillRootCatalog::build(workspace, home_dir, configured_skills_dir);
+    let present: Vec<PathBuf> = catalog
+        .roots
+        .iter()
+        .filter(|root| {
+            root.scope == SkillScope::Project
+                && root.active_for_runtime
+                && path_is_existing_dir(&root.path)
+        })
+        .map(|root| root.path.clone())
+        .collect();
+    if present.is_empty() || crate::config::is_workspace_trusted(workspace) {
+        return Vec::new();
+    }
+    present
+}
+
+/// Whether `skills_dir` may load right now. A directory in project scope
+/// (repository-supplied, resolving inside the workspace) is held to the same
+/// workspace-trust gate as [`SkillRootCatalog::runtime_directories`], so an
+/// explicit or resolved skills dir cannot re-admit what the catalog filtered.
+/// A session rooted at the home directory is exempt: every path under it is
+/// the user's own global content, which the catalog also loads as global.
+#[must_use]
+pub fn skills_dir_allowed_by_workspace_trust(
+    workspace: &Path,
+    home_dir: Option<&Path>,
+    skills_dir: &Path,
+) -> bool {
+    classify_configured_skills_dir(workspace, home_dir, skills_dir).2 != SkillScope::Project
+        || home_dir.is_some_and(|home| paths_refer_to_same_dir(home, workspace))
+        || crate::config::is_workspace_trusted(workspace)
 }
 
 /// Resolve candidate skill directories for runtime discovery (existing paths
@@ -735,10 +775,27 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_home_has_no_ambient_global_or_cache_root() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = SkillRootCatalog::build(tmp.path(), None, None);
+        assert!(
+            catalog
+                .roots
+                .iter()
+                .all(|root| root.scope == SkillScope::Project)
+        );
+        let owned = catalog.owned_writable_roots();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].kind, SkillRootKind::CodeWhaleProject);
+        assert_eq!(owned[0].path, tmp.path().join(".codewhale/skills"));
+    }
+
+    #[test]
     fn runtime_compatible_preserves_historical_workspace_order() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("ws");
         let home = tmp.path().join("home");
+        crate::test_support::trust_workspace(&workspace);
         write_dir(&workspace.join(".agents").join("skills"));
         write_dir(&workspace.join("skills"));
         write_dir(&workspace.join(".claude").join("skills"));
@@ -798,6 +855,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("ws");
         let home = tmp.path().join("home");
+        crate::test_support::trust_workspace(&workspace);
         write_dir(&workspace.join(".agents").join("skills"));
         write_dir(&workspace.join(".codewhale").join("skills"));
         write_dir(&home.join(".codewhale").join("skills"));

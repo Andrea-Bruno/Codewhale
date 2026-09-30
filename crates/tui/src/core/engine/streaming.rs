@@ -17,6 +17,7 @@ pub(super) enum ContentBlockKind {
 #[derive(Debug, Clone)]
 pub(super) struct ToolUseState {
     pub(super) id: String,
+    pub(super) execution_id: String,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) caller: Option<ToolCaller>,
@@ -25,6 +26,16 @@ pub(super) struct ToolUseState {
     pub(super) thought_signature: Option<String>,
     pub(super) input_buffer: String,
     pub(super) input_parse_error: Option<String>,
+}
+
+impl ToolUseState {
+    pub(super) fn model_call(&self) -> crate::core::events::ModelToolCall {
+        crate::core::events::ModelToolCall {
+            provider_id: self.id.clone(),
+            caller: self.caller.clone(),
+            thought_signature: self.thought_signature.clone(),
+        }
+    }
 }
 
 /// Maximum total bytes of text/thinking content before aborting the stream.
@@ -44,12 +55,14 @@ pub(super) const STREAM_MAX_DURATION_SECS: u64 = 1800; // 30 minutes (was 300s; 
 /// Hard cap on consecutive recoverable stream errors before we surface a turn
 /// failure. Bumped 3 → 5 in v0.6.7 along with the HTTP/2 keepalive defaults
 /// (#103) — keepalive should make spurious decode errors rarer, so we can
-/// tolerate a longer streak before giving up on the turn.
+/// tolerate a longer streak before giving up on the turn. This is the
+/// default; `[tui].stream_max_errors` overrides it (#6700).
 pub(super) const MAX_STREAM_ERRORS_BEFORE_FAIL: u32 = 5;
 /// Cap on transparent stream-level retries — these only happen when the wire
 /// dies before any content was streamed. The user has seen nothing, but
 /// provider usage or billing may already exist. Two attempts can ride out a
-/// flaky edge node without amplifying real outages (#103).
+/// flaky edge node without amplifying real outages (#103). This is the
+/// default; `[tui].stream_max_transparent_retries` overrides it (#6700).
 pub(super) const MAX_TRANSPARENT_STREAM_RETRIES: u32 = 2;
 
 /// Decide whether a stream error is eligible for a transparent retry.
@@ -58,7 +71,9 @@ pub(super) const MAX_TRANSPARENT_STREAM_RETRIES: u32 = 2;
 /// 1. No content has been received on the current attempt. Reissuing after
 ///    visible partial deltas needs a separate recovery policy. This content
 ///    check is not evidence that the provider consumed or billed zero tokens.
-/// 2. We still have transparent-retry budget remaining.
+/// 2. We still have transparent-retry budget remaining (`max_attempts`,
+///    `[tui].stream_max_transparent_retries`, default
+///    [`MAX_TRANSPARENT_STREAM_RETRIES`]).
 /// 3. The turn has not been cancelled.
 ///
 /// Extracted as a pure function so the four #103 retry cases can be exercised
@@ -66,14 +81,16 @@ pub(super) const MAX_TRANSPARENT_STREAM_RETRIES: u32 = 2;
 pub(super) fn should_transparently_retry_stream(
     any_content_received: bool,
     transparent_attempts: u32,
+    max_attempts: u32,
     cancelled: bool,
 ) -> bool {
-    !any_content_received && transparent_attempts < MAX_TRANSPARENT_STREAM_RETRIES && !cancelled
+    !any_content_received && transparent_attempts < max_attempts && !cancelled
 }
 
-/// Budget for re-issuing the whole request after a dead stream. Shared by the
-/// nothing-streamed outer retry (#103 Phase 3) and the sleep-resume retry
-/// (#2990).
+/// Default budget for re-issuing the whole request after a dead stream.
+/// Shared by the nothing-streamed outer retry (#103 Phase 3), the
+/// sleep-resume retry (#2990), the network-drop resumes, and stream-open
+/// failures (#6699). Overridable via `[tui].stream_max_resumes` (#6700).
 pub(super) const MAX_STREAM_RETRIES: u32 = 3;
 
 /// Typed, engine-internal state for one mid-stream drop recovery.
@@ -113,15 +130,33 @@ pub(super) enum StreamResume {
 /// Bounded authorization for drop-resume retries.
 ///
 /// Mechanism, not comment: [`StreamRetryBudget::authorize`] is the only way
-/// to spend a resume and it returns `None` once [`MAX_STREAM_RETRIES`]
-/// resumes have been issued, so no call site can loop past the budget even
-/// if a guard predicate is relaxed. A healthy stream round resets it.
-#[derive(Debug, Default)]
+/// to spend a resume and it returns `None` once `limit` resumes (default
+/// [`MAX_STREAM_RETRIES`]) have been issued, so no call site can loop past
+/// the budget even if a guard predicate is relaxed. A healthy stream round
+/// resets it.
+#[derive(Debug)]
 pub(super) struct StreamRetryBudget {
     spent: u32,
+    limit: u32,
+}
+
+impl Default for StreamRetryBudget {
+    fn default() -> Self {
+        Self::with_limit(MAX_STREAM_RETRIES)
+    }
 }
 
 impl StreamRetryBudget {
+    /// A fresh budget allowing at most `limit` resumes.
+    pub(super) fn with_limit(limit: u32) -> Self {
+        Self { spent: 0, limit }
+    }
+
+    /// The configured resume ceiling.
+    pub(super) fn limit(&self) -> u32 {
+        self.limit
+    }
+
     /// Drop-resumes already issued without a healthy round in between.
     pub(super) fn spent(&self) -> u32 {
         self.spent
@@ -130,7 +165,7 @@ impl StreamRetryBudget {
     /// Spend one resume and return its 1-based attempt number, or `None`
     /// when the budget is exhausted.
     pub(super) fn authorize(&mut self) -> Option<u32> {
-        if self.spent >= MAX_STREAM_RETRIES {
+        if self.spent >= self.limit {
             return None;
         }
         self.spent = self.spent.saturating_add(1);
@@ -170,9 +205,10 @@ pub(super) fn sleep_gap_detected(monotonic_elapsed: Duration, wallclock_elapsed:
 pub(super) fn should_resume_after_sleep(
     sleep_detected: bool,
     retry_attempts: u32,
+    retry_limit: u32,
     cancelled: bool,
 ) -> bool {
-    sleep_detected && retry_attempts < MAX_STREAM_RETRIES && !cancelled
+    sleep_detected && retry_attempts < retry_limit && !cancelled
 }
 
 /// Decide whether a failed stream should be re-issued after a mid-stream
@@ -194,9 +230,10 @@ pub(super) fn should_resume_after_network_drop(
     headless_host: bool,
     network_class_error: bool,
     retry_attempts: u32,
+    retry_limit: u32,
     cancelled: bool,
 ) -> bool {
-    headless_host && network_class_error && retry_attempts < MAX_STREAM_RETRIES && !cancelled
+    headless_host && network_class_error && retry_attempts < retry_limit && !cancelled
 }
 
 /// Decide whether an interactive TUI stream should be re-issued after a
@@ -219,13 +256,14 @@ pub(super) fn should_resume_interactive_after_network_drop(
     any_content_received: bool,
     tool_uses_empty: bool,
     retry_attempts: u32,
+    retry_limit: u32,
     cancelled: bool,
 ) -> bool {
     terminal_chrome_enabled
         && network_class_error
         && any_content_received
         && tool_uses_empty
-        && retry_attempts < MAX_STREAM_RETRIES
+        && retry_attempts < retry_limit
         && !cancelled
 }
 
@@ -261,7 +299,9 @@ pub(super) fn stream_read_error_user_message(message: &str, any_content_received
 ///
 /// 1. Generic/Anthropic-style (`[TOOL_CALL]`, `<invoke …>`, `<function_calls>`).
 /// 2. DSML wrappers, in fullwidth `｜` (U+FF5C) and ASCII `|` delimiters, upper
-///    and lower case.
+///    and lower case. DeepSeek also emits a doubled-delimiter form
+///    (`<｜｜DSML｜｜ calls>`) when a request offers no tools; one-shot
+///    `codewhale exec` printed it verbatim as the answer.
 /// 3. **DeepSeek's native tool-call tokens** (#3880). DeepSeek's chat template
 ///    separates words with `▁` (U+2581 LOWER ONE EIGHTH BLOCK), not a space or
 ///    underscore, so `<｜tool▁calls▁begin｜>` does not match any DSML entry and
@@ -271,7 +311,7 @@ pub(super) fn stream_read_error_user_message(message: &str, any_content_received
 ///
 /// When adding a shape, add it here and to the two marker tables below.
 /// `marker_tables_are_consistent` enforces that they agree.
-pub(crate) const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 28] = [
+pub(crate) const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 30] = [
     ("[TOOL_CALL]", "[/TOOL_CALL]"),
     ("<codewhale:tool_call", "</codewhale:tool_call>"),
     ("<tool_call", "</tool_call>"),
@@ -283,6 +323,8 @@ pub(crate) const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 28] = [
     ("<|DSML|invoke ", "</|DSML|invoke>"),
     ("<|dsml|tool_calls>", "</|dsml|tool_calls>"),
     ("<|dsml|invoke ", "</|dsml|invoke>"),
+    ("<｜｜DSML｜｜ calls>", "</｜｜DSML｜｜ calls>"),
+    ("<｜｜DSML｜｜ invoke ", "</｜｜DSML｜｜ invoke>"),
     ("<|tool_calls>", "</|tool_calls>"),
     // DeepSeek native, fullwidth delimiters, U+2581 separator.
     ("<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>"),
@@ -305,7 +347,7 @@ pub(crate) const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 28] = [
     ("<|tool_output_begin|>", "<|tool_output_end|>"),
 ];
 
-pub(crate) const TOOL_CALL_START_MARKERS: [&str; 28] = [
+pub(crate) const TOOL_CALL_START_MARKERS: [&str; 30] = [
     "[TOOL_CALL]",
     "<codewhale:tool_call",
     "<tool_call",
@@ -317,6 +359,8 @@ pub(crate) const TOOL_CALL_START_MARKERS: [&str; 28] = [
     "<|DSML|invoke ",
     "<|dsml|tool_calls>",
     "<|dsml|invoke ",
+    "<｜｜DSML｜｜ calls>",
+    "<｜｜DSML｜｜ invoke ",
     "<|tool_calls>",
     "<｜tool▁calls▁begin｜>",
     "<｜tool▁call▁begin｜>",
@@ -336,7 +380,7 @@ pub(crate) const TOOL_CALL_START_MARKERS: [&str; 28] = [
     "<|tool_output_begin|>",
 ];
 
-pub(crate) const TOOL_CALL_END_MARKERS: [&str; 28] = [
+pub(crate) const TOOL_CALL_END_MARKERS: [&str; 30] = [
     "[/TOOL_CALL]",
     "</codewhale:tool_call>",
     "</tool_call>",
@@ -348,6 +392,8 @@ pub(crate) const TOOL_CALL_END_MARKERS: [&str; 28] = [
     "</|DSML|invoke>",
     "</|dsml|tool_calls>",
     "</|dsml|invoke>",
+    "</｜｜DSML｜｜ calls>",
+    "</｜｜DSML｜｜ invoke>",
     "</|tool_calls>",
     "<｜tool▁calls▁end｜>",
     "<｜tool▁call▁end｜>",
@@ -485,10 +531,15 @@ pub(crate) fn filter_tool_call_delta_with_state(
 
     loop {
         if state.in_tool_call {
+            // Close only on the opener's own end marker when it is known.
+            // Falling back to any end marker let a nested closer inside a
+            // DSML block (`</｜DSML｜invoke>`) end the block whenever a delta
+            // lacked the outer closer, leaking `</｜DSML｜tool_calls>`.
             let active_end_marker = state.active_end_marker;
-            let found = active_end_marker
-                .and_then(|marker| rest.find(marker).map(|idx| (idx, marker.len())))
-                .or_else(|| find_first_marker(rest, &TOOL_CALL_END_MARKERS));
+            let found = match active_end_marker {
+                Some(marker) => rest.find(marker).map(|idx| (idx, marker.len())),
+                None => find_first_marker(rest, &TOOL_CALL_END_MARKERS),
+            };
             let Some((idx, len)) = found else {
                 let keep = active_end_marker.map_or_else(
                     || trailing_marker_prefix_len(rest, &TOOL_CALL_END_MARKERS),

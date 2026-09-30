@@ -13,13 +13,14 @@ contract.
 
 ## Scope
 
-Hooks are a **TUI runtime feature**. Every firing point lives in the
-interactive TUI and in the engine turn loop it drives.
+Hooks fire in the interactive TUI and in the engine turn loop, which the
+Runtime API threads behind the desktop app and web drive as well.
 
 | Surface | Fires hooks |
 | --- | --- |
 | `codewhale` / `codew` interactive TUI | yes |
 | `codewhale exec` (headless one-shot) | opt-in: `--hooks` fires `tool_call_before` and `shell_env` |
+| Runtime API threads (desktop app, web) | yes: `tool_call_before`, `shell_env`, `tool_call_after`, `on_error`; `GET /v1/hooks` lists the set |
 | the `codewhale` CLI dispatcher and its subcommands | no |
 | app-server / ACP | no |
 | the `workflow` tool and sub-agent *internals* | no — but the TUI fires `subagent_spawn` / `subagent_complete` around them |
@@ -185,6 +186,9 @@ Three rules keep conditions from lying:
 - **`exit_code` needs a real exit code.** It matches only when the event
   actually observed a process exit code — `tool_call_after`, or `on_error` for
   a tool failure, in both cases for a process-backed tool such as `bash`.
+  A command that exits nonzero reports its code too, even though `bash`
+  returns it as a failed call. A timed-out or killed command usually has no
+  exit code; `DEEPSEEK_TOOL_STATUS` says which it was.
   A tool that reports no exit code never matches an `exit_code` condition; the
   condition is not satisfied by a default, a zero, or a success flag. The value
   is a 64-bit integer, so a Windows crash code such as `3221225477`
@@ -305,8 +309,55 @@ rebrand.
 | `DEEPSEEK_TOOL_ARGS` | `tool_call_before`, `shell_env` | tool input JSON preview, capped at 10 000 bytes |
 | `DEEPSEEK_TOOL_RESULT` | `tool_call_after`, `on_error` (tool failures) | truncated at 10 000 bytes |
 | `DEEPSEEK_TOOL_SUCCESS` | `tool_call_after`, `on_error` (tool failures) | `true` / `false` |
-| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` and `on_error` **when the tool reported one** | absent otherwise — never synthesized; 64-bit, so Windows crash codes such as `3221225477` survive |
+| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` and `on_error` **when the tool reported one** | absent otherwise — never synthesized; set for a failing command as well as a passing one; 64-bit, so Windows crash codes such as `3221225477` survive |
+| `DEEPSEEK_TOOL_STATUS` | `tool_call_after` and `on_error` **when a shell tool reported one** | `completed`, `failed`, `timed_out`, `killed`, or `running` (moved to the background); absent for other tools |
+| `DEEPSEEK_TOOL_EXECUTION_RECEIPT` | `tool_call_after` and `on_error` **for a settled, local, foreground shell run** | complete JSON, at most 32 KiB, or absent; see [Execution receipt](#execution-receipt) |
 | `DEEPSEEK_SESSION_COST` | when cost is supplied | USD, six decimal places |
+
+### Execution receipt
+
+`DEEPSEEK_TOOL_EXECUTION_RECEIPT` says what a shell tool (`bash`, `Bash`,
+`exec_shell`) actually ran. The before-hook input is not the same thing: a
+`tool_call_before` hook can rewrite it. The receipt is built from what the
+process manager recorded when it spawned the process, after admission and
+any rewrite.
+
+```json
+{"schema_version":1,"command":"printf hello","cwd":"/absolute/workspace","state":"completed","scope":"local","exit_code":0,"stdout":"hello","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_kind":"separate"}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `command` | the admitted shell source handed to the shell, not the shell executable or its argv wrapper |
+| `cwd` | the canonical absolute path of the directory the process started in: symlinks are resolved, so a directory has one spelling whether or not the call passed `cwd`; it is resolved before spawn and that same path is handed to the OS |
+| `state` | `completed` for an observed exit, including a nonzero one; `interrupted` for a signal, kill, cancel, or timeout |
+| `scope` | always `local` in schema 1 |
+| `exit_code` | the observed integer, or `null`; never synthesized from `state` |
+| `stdout`, `stderr` | previews of the tool's retained output, which may already omit early process output; long previews keep their first and last bytes around a `[receipt preview truncated]` marker |
+| `stdout_truncated`, `stderr_truncated` | `true` when the tool's own output capture or the preview dropped bytes |
+| `output_kind` | `separate` for `Bash` / `exec_shell`; `combined` for lowercase `bash`, whose stdout and stderr share one pipe — `stdout` then holds the combined preview and `stderr` is empty |
+
+The rules are conservative:
+
+- **Exact or absent.** `command` and `cwd` are never truncated. If either is
+  over 8 KiB, contains NUL, or the directory is relative, not UTF-8, or cannot
+  resolve before spawn, the receipt is left out. So is a run whose end the shell
+  tool could not observe (the OS wait itself failed): its state is unknown,
+  and the receipt does not guess it. Previews shrink until the serialized JSON fits 32 KiB;
+  if it still cannot fit, the receipt is left out rather than cut.
+- **Absence means nothing.** It implies neither success nor failure. An inherited
+  `DEEPSEEK_TOOL_EXECUTION_RECEIPT` is cleared before applying the current call's context.
+- **Scope.** A receipt is built only while a `tool_call_after` or `on_error`
+  hook is configured, and only for a settled, pipe-backed, unsandboxed, local
+  foreground run. Background launches, a foreground run moved to `/jobs`,
+  PTY (`tty` / `combined_output`) and interactive sessions, OS-sandboxed and
+  external-backend execution, the read-only shell's hardened argv, Windows,
+  a PowerShell shell on any platform (it wraps the source or runs it from a
+  temporary script), and calls refused before execution have none.
+- **Hooks only.** The receipt is not kept in the durable Runtime API item
+  record; that record already carries the tool output.
+- It is set for a failed run as well as a passing one, so `on_error` for a
+  failed shell call carries it too. Every other variable is unchanged.
 
 **Mode-spelling note.** UI-fired events (`session_start`, `session_end`,
 `message_submit`, `tool_call_after`, `mode_change`, `on_error`, `turn_end`,

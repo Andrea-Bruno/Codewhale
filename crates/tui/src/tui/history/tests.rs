@@ -1530,6 +1530,30 @@ fn error_severity_ranks_stay_visually_distinguishable() {
     assert_eq!(body_fg, error_fg);
 }
 
+#[test]
+fn error_guidance_keeps_recovery_commands_on_their_own_line() {
+    let cell = HistoryCell::Error {
+        message: "DeepSeek API key not found.\nSave it:\n  codewhale auth set --provider deepseek"
+            .to_string(),
+        severity: crate::error_taxonomy::ErrorSeverity::Error,
+    };
+    for width in [80, 140] {
+        let lines = cell.lines(width);
+        let command_line = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("codewhale auth set --provider deepseek"))
+            .expect("recovery command stays intact");
+        assert!(!command_line.contains('\n'), "{command_line:?}");
+        assert!(!command_line.contains("Save it:"), "{command_line:?}");
+    }
+}
+
 /// A multiline failure can run past the bottom of the terminal while its full
 /// text stays in history. The live cell advertises the pager; the pager and the
 /// transcript must carry the recovery instruction verbatim and must not
@@ -1590,10 +1614,11 @@ fn a_web_search_receipt_names_its_source_and_any_degradation() {
     }
 }
 
-/// A workflow card stands in for a whole fan-out the user cannot see. The run
-/// card reports lifecycle, child count, phases and failures without repeating
-/// the header in the body; the expanded card adds the goal, the child labels,
-/// the final result and the error; the status card lists the runs it found.
+/// A workflow's transcript is one row per run; live progress is the
+/// workbar's. A foreground `run` card that returned its settled record says
+/// only the finish — the final state replaces `started` — without repeating the header
+/// in a body; the expanded card adds the goal, the child labels, the final
+/// result and the error; the status card lists the runs it found.
 ///
 /// Replaces three tests, and drops assertions of the form
 /// `contains('s') || contains('m')` — true of essentially any English string.
@@ -1622,10 +1647,14 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
     run.output = Some(run_output);
     let text = lines_text(&run.lines_with_mode(120, true, RenderMode::Live));
     assert!(
-        text.contains("/3 done"),
-        "settled/total child count: {text:?}"
+        !text.contains("started"),
+        "the settled record replaces the start line: {text:?}"
     );
-    assert!(text.contains("phase"), "phase count: {text:?}");
+    assert!(
+        text.contains("finished") && text.contains("/3 done"),
+        "the finish line with done/total agents: {text:?}"
+    );
+    assert_eq!(text.lines().count(), 1, "one row for the run: {text:?}");
     // #6503: a run with no failures does not announce `0 fail`.
     assert!(!text.contains("fail"), "no zero failure count: {text:?}");
     assert!(
@@ -1693,6 +1722,76 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
     }
 }
 
+/// The founder's transcript (2026-09-28): a refused `start` echoed
+/// `action: start` and hid its reason; the settled run's reason was cut
+/// mid-word. Each is one row that says why.
+#[test]
+fn workflow_rows_say_why_without_raw_action_or_mid_word_cuts() {
+    let mut refused = generic_tool("workflow", ToolStatus::Failed);
+    refused.input_summary = Some("action: start".to_string());
+    refused.output = Some(
+        "Error: Invalid input for tool 'workflow': Workflow leaf 'engine-readiness': \
+         task(): cwd entries must be bounded repo-relative paths\n\
+         Tool validation feedback: {\"category\":\"invalid_input\"}"
+            .to_string(),
+    );
+    let text = lines_text(&refused.lines_with_mode(100, true, RenderMode::Live));
+    assert!(!text.contains("action: start"), "{text}");
+    assert!(
+        text.contains("cwd entries must be bounded repo-relative paths"),
+        "{text}"
+    );
+    assert!(!text.contains("Invalid input for tool"), "{text}");
+
+    let reason = "[auth] Authorization failed: You have run out of credits or need a Grok \
+                  subscription. Add credits at https://grok.com/?_s=usage.";
+    let failed = serde_json::json!({
+        "run_id": "workflow_6409ebe6",
+        "status": "failed",
+        "workflow_goal": "Read-only release-readiness audit for Codewhale v0.10.1. Determine blockers.",
+        "started_at_ms": 1_000,
+        "completed_at_ms": 1_355,
+        "error": "no task produced a result: all 2 task(s) failed and 1 fan-out(s) lost every slot (no work survived them); the recorded result reflects no completed work",
+        "transcript_line": "finished",
+        "events": [
+            {"type": "run_started", "at_ms": 1_000, "workflow_goal": "Read-only release-readiness audit for Codewhale v0.10.1. Determine blockers."},
+            {"type": "task_started", "at_ms": 1_080, "task_id": "a", "workflow_task_label": "engine-readiness"},
+            {"type": "task_started", "at_ms": 1_117, "task_id": "b", "workflow_task_label": "desktop-readiness"},
+            {"type": "task_completed", "at_ms": 1_329, "task_id": "a", "status": "failed", "reason": reason},
+            {"type": "task_completed", "at_ms": 1_338, "task_id": "b", "status": "failed", "reason": reason},
+            {"type": "run_completed", "at_ms": 1_355, "status": "failed"},
+        ],
+    })
+    .to_string();
+    let mut finish = generic_tool("workflow", ToolStatus::Failed);
+    finish.output = Some(failed);
+    let text = lines_text(&finish.lines_with_mode(60, true, RenderMode::Live));
+    assert!(!text.contains("started"), "{text}");
+    assert!(text.contains("0/2 done · 2 failed"), "{text}");
+    assert!(text.contains("355ms"), "{text}");
+    // The whole first sentence, wrapped, never cut.
+    let flat = text
+        .split_whitespace()
+        .filter(|word| {
+            !word
+                .chars()
+                .all(|ch| ('\u{2500}'..='\u{259F}').contains(&ch))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains(
+            "Authorization failed: You have run out of credits or need a Grok subscription"
+        ),
+        "{text}"
+    );
+    assert!(
+        !flat.contains("grok.com"),
+        "only the first sentence: {text}"
+    );
+    assert!(!text.contains("..."), "{text}");
+}
+
 #[test]
 fn degraded_workflow_receipt_is_terminal_warning_not_running_or_success() {
     let output = serde_json::json!({
@@ -1714,7 +1813,10 @@ fn degraded_workflow_receipt_is_terminal_warning_not_running_or_success() {
 
     let lines = run.lines_with_mode(120, false, RenderMode::Live);
     let text = lines_text(&lines);
-    assert!(text.contains("issue"), "warning receipt missing: {text:?}");
+    assert!(
+        text.contains("finished with gaps"),
+        "warning receipt missing: {text:?}"
+    );
     assert!(
         !text.to_lowercase().contains(" done"),
         "must not read as success: {text:?}"
@@ -1727,7 +1829,7 @@ fn degraded_workflow_receipt_is_terminal_warning_not_running_or_success() {
     let warning = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "issue")
+        .find(|span| span.content.as_ref() == "finished with gaps")
         .expect("terminal warning status span");
     assert_eq!(
         warning.style.fg,
@@ -2009,6 +2111,7 @@ fn replay_routes_repair_receipts_and_plan_calls_to_typed_cells() {
     let plan = Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: "plan-1".to_string(),
             name: "update_plan".to_string(),
             input: serde_json::json!({
@@ -2689,6 +2792,148 @@ fn first_file_line_reference_returns_one_match_and_resolves_it() {
     assert_eq!(line, 12);
 }
 
+/// The forms tools and models print: rustc's `-->` locator with a column,
+/// a backticked reference, and one inside a sentence with punctuation.
+#[test]
+fn file_line_reference_reads_common_forms_on_one_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/a.rs"), "fn a() {}\n").unwrap();
+    let expected = Some((workspace.join("src/a.rs"), 12));
+
+    for line in [
+        "  --> src/a.rs:12:5",
+        "see `src/a.rs:12` for the loop",
+        "the bug is in (src/a.rs:12), again.",
+        "src/a.rs:12: error: mismatched types",
+        "./src/a.rs:12",
+    ] {
+        assert_eq!(
+            super::file_line_reference(line, workspace),
+            expected,
+            "{line:?}"
+        );
+    }
+    assert_eq!(super::file_line_reference("src/a.rs:0", workspace), None);
+}
+
+/// Model output is not trusted to name a file: an absolute path outside the
+/// workspace and a `../` escape both used to open in `$EDITOR`.
+#[test]
+fn file_line_reference_refuses_paths_outside_the_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("ws");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/in.rs"), "fn a() {}\n").unwrap();
+    let outside = root.path().join("outside.rs");
+    std::fs::write(&outside, "secret\n").unwrap();
+
+    let absolute_outside = format!("{}:3", outside.display());
+    assert_eq!(
+        super::file_line_reference(&absolute_outside, &workspace),
+        None
+    );
+    assert_eq!(
+        super::file_line_reference("../outside.rs:3", &workspace),
+        None
+    );
+    assert_eq!(
+        super::first_file_line_reference(
+            &format!("{absolute_outside}\n../outside.rs:1\n"),
+            &workspace
+        ),
+        None
+    );
+
+    let absolute_inside = format!("{}:4", workspace.join("src/in.rs").display());
+    assert_eq!(
+        super::file_line_reference(&absolute_inside, &workspace),
+        Some((workspace.join("src/in.rs"), 4)),
+        "an absolute path inside the workspace still opens"
+    );
+}
+
+/// A link inside the workspace passed the text-only check and `is_file()`
+/// followed it, so `vendor -> <outside>` or `notes.md -> <outside file>` in
+/// model output offered "Open in editor" on a file outside the workspace.
+#[cfg(unix)]
+#[test]
+fn file_line_reference_refuses_links_out_of_the_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("ws");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.rs"), "secret\n").unwrap();
+    std::fs::write(workspace.join("src/in.rs"), "fn a() {}\n").unwrap();
+    std::os::unix::fs::symlink(&outside, workspace.join("vendor")).unwrap();
+    std::os::unix::fs::symlink(outside.join("secret.rs"), workspace.join("notes.rs")).unwrap();
+    // A link that stays inside is still a link: refused, not followed.
+    std::os::unix::fs::symlink(workspace.join("src"), workspace.join("alias")).unwrap();
+
+    for line in ["vendor/secret.rs:1", "notes.rs:1", "alias/in.rs:1"] {
+        assert_eq!(
+            super::file_line_reference(line, &workspace),
+            None,
+            "{line:?}"
+        );
+    }
+    assert_eq!(
+        super::workspace_file(&workspace, "src"),
+        None,
+        "a directory"
+    );
+    assert_eq!(
+        super::file_line_reference("src/in.rs:2", &workspace),
+        Some((workspace.join("src/in.rs"), 2))
+    );
+}
+
+/// The two escapes the review named: a directory link to `/` and links into
+/// an `.ssh` directory. The `.ssh` here is one the test creates outside the
+/// workspace with real files in it, so a follow-the-link check would find
+/// them and resolve; the test does not depend on the host's own keys.
+#[cfg(unix)]
+#[test]
+fn file_line_reference_refuses_links_to_root_and_ssh() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = &dir.path().join("ws");
+    std::fs::create_dir_all(workspace).unwrap();
+    std::os::unix::fs::symlink("/", workspace.join("rootfs")).unwrap();
+    let ssh = dir.path().join("home/.ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(ssh.join("id_ed25519"), "PRIVATE KEY\n").unwrap();
+    std::fs::write(ssh.join("config"), "Host *\n").unwrap();
+    std::os::unix::fs::symlink(ssh.join("id_ed25519"), workspace.join("key.rs")).unwrap();
+    std::os::unix::fs::symlink(&ssh, workspace.join("ssh")).unwrap();
+    assert!(workspace.join("key.rs").is_file(), "the file link resolves");
+    assert!(
+        workspace.join("ssh/config").is_file(),
+        "the dir link resolves"
+    );
+
+    for line in [
+        "rootfs/etc/hosts:1",
+        "./rootfs/etc/hosts:1",
+        "key.rs:1",
+        "ssh/config:1",
+        "ssh/id_ed25519:1",
+    ] {
+        assert_eq!(
+            super::file_line_reference(line, workspace),
+            None,
+            "{line:?}"
+        );
+    }
+    let absolute = workspace.join("rootfs/etc/hosts");
+    assert_eq!(
+        super::workspace_file(workspace, absolute.to_str().unwrap()),
+        None,
+        "an absolute path through the link"
+    );
+}
+
 #[test]
 fn first_file_line_reference_skips_unresolvable_and_malformed_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -2714,4 +2959,20 @@ fn first_file_line_reference_skips_unresolvable_and_malformed_rows() {
         super::first_file_line_reference("no references here\n", workspace).is_none(),
         "a cell with nothing to open must report nothing, not a default"
     );
+}
+
+/// #6601: the project-trust warning is a runtime-owned internal message; the
+/// model reads it, the transcript never shows it as the user's words.
+#[test]
+fn workspace_trust_warning_renders_no_transcript_cell() {
+    for warning in [Some("untrusted project skills were skipped"), None] {
+        let message = crate::runtime_handoff::workspace_trust_runtime_message(warning);
+        assert!(crate::runtime_handoff::is_internal_runtime_handoff(
+            &message
+        ));
+        assert!(
+            super::history_cells_from_message(&message).is_empty(),
+            "{warning:?}"
+        );
+    }
 }

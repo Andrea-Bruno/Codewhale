@@ -2,11 +2,11 @@
 
 > 本文翻译自英文版 [FLEET.md](../FLEET.md)，与英文修订 `fc23323c4`（2026-08-17）同步。
 
-Agent Fleet 是面向持久化多 worker 运行的本地优先控制平面。它**不是**一个独立的执行引擎：fleet worker 就是一次由 fleet 启动并持久跟踪的无头 `codewhale exec` 运行。关于子代理、`exec` 与 fleet 如何汇聚到同一个持久运行时，请参阅 [AGENT_RUNTIME.md](../AGENT_RUNTIME.md)。在产品语言里，用户仍然可以"打开一个子代理"；在架构语言里，持久的嵌套工作应当是一个带 role 的 fleet-backed worker。
+Agent Fleet 是面向持久化多 worker 运行的本地优先控制平面。它**不是**一个独立的执行引擎：fleet worker 就是一次由 fleet 启动并持久跟踪的无头 `codewhale exec` 运行。关于子代理、`exec` 与 fleet 如何汇聚到同一个持久运行时，请参阅 [AGENT_RUNTIME.md](./AGENT_RUNTIME.md)。在产品语言里，用户仍然可以"打开一个子代理"；在架构语言里，持久的嵌套工作应当是一个带 role 的 fleet-backed worker。
 
 只要工作场景需要重试、睡眠/重启后存活、远程执行、回执（receipt）或有账本（ledger）的审计轨迹，就应该使用 Fleet 而不是短命的 `agent` 扇出。初始 CLI 表面如下：
 
-关于结合 Fleet 任务规范与 Workflow 编排的引导式端到端监控演练，请参阅 [Fleet + Workflow Tutorial](../FLEET_WORKFLOW_TUTORIAL.md)。
+关于结合 Fleet 任务规范与 Workflow 编排的引导式端到端监控演练，请参阅 [Fleet + Workflow Tutorial](./FLEET_WORKFLOW_TUTORIAL.md)。
 
 ```sh
 codewhale fleet init
@@ -488,11 +488,11 @@ Secret 引用在日志与 ledger 条目中一律脱敏：`<secret:env.GH_TOKEN>`
 workers 用四种方法之一向 fleet manager 认证：
 
 - **None** — 共享相同 uid 的本地 worker（默认）
-- **SSH key** — 可选的宿主密钥指纹固定与 known-hosts 验证。`host_key_fingerprint` 字段（SHA256:...）固定预期服务器密钥，防止首次连接时的 MITM 攻击。
+- **SSH key** — 使用 known-hosts 文件严格验证宿主密钥。SSH host 配置不支持 `host_key_fingerprint`；设置该字段会导致配置错误，请改用 `known_hosts`。
 - **Token** — 从 `FleetSecretRef` 解析的 bearer token，适用于 fleet 代理后的远程 worker。
 - **mTLS** — 带客户端证书与秘密支撑私钥的相互 TLS。
 
-SSH workers 在生产中应始终设置 `host_key_fingerprint`：
+SSH workers 应配置包含已核验宿主密钥的 `known_hosts` 文件：
 
 ```json
 {
@@ -505,7 +505,6 @@ SSH workers 在生产中应始终设置 `host_key_fingerprint`：
     "user": "codewhale",
     "port": 22,
     "identity": "~/.ssh/codewhale_fleet",
-    "host_key_fingerprint": "SHA256:aLGqZo1M6c...",
     "known_hosts": "~/.ssh/known_hosts",
     "working_directory": "/srv/codewhale/work",
     "env_allowlist": ["CODEWHALE_PROFILE"],

@@ -46,6 +46,7 @@ use crate::tui::views::{
     ActionHint, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     render_underwater_surface,
 };
+use crate::utils::format_context_window;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 
@@ -70,10 +71,10 @@ const DEEPSEEK_PICKER_EFFORTS: &[ReasoningEffort] = &[
 /// Kimi Code K3 accepts route-specific low and medium controls at the
 /// official membership endpoint. Medium becomes K3's nested high wire effort,
 /// but keeping the selected intent visible is important for recovery and
-/// route receipts.
+/// route receipts. K3 is always-thinking, so `off` would only land on `low`
+/// and is not offered.
 const KIMI_CODE_K3_PICKER_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Auto,
-    ReasoningEffort::Off,
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
     ReasoningEffort::High,
@@ -2371,14 +2372,6 @@ fn inactive_custom_route_identities(app: &App, config: &Config) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    // The legacy root-field `provider = "custom"` shape owns no
-    // `[providers.<name>]` table but is still a real route.
-    if config.uses_legacy_literal_custom_route() {
-        let literal = ApiProvider::Custom.as_str().to_string();
-        if !identities.contains(&literal) {
-            identities.push(literal);
-        }
-    }
     identities.sort();
     identities.retain(|identity| active != Some(identity.as_str()));
     identities
@@ -3083,11 +3076,11 @@ fn model_row_meta_chips(row: &ModelPickerRow) -> Vec<String> {
             "user declared (unverified)".to_string(),
             row.metadata
                 .context_window
-                .map(|value| format_picker_context_window(u64::from(value)))
+                .map(|value| format_context_window(u64::from(value)))
                 .unwrap_or_else(|| "context unknown".into()),
             row.metadata
                 .max_output
-                .map(|value| format!("{} out", format_picker_context_window(u64::from(value))))
+                .map(|value| format!("{} out", format_context_window(u64::from(value))))
                 .unwrap_or_else(|| "output unknown".into()),
             match &row.metadata.pricing {
                 PickerPricing::Known(price) => format!("estimate {price}"),
@@ -3117,7 +3110,7 @@ fn model_row_meta_chips(row: &ModelPickerRow) -> Vec<String> {
     }
     let mut chips = Vec::new();
     if let Some(context_window) = row.metadata.context_window {
-        chips.push(format_picker_context_window(u64::from(context_window)));
+        chips.push(format_context_window(u64::from(context_window)));
     }
     // The reasoning stance is the most decision-relevant fact for a coding
     // harness, so it sits before the limits/modality chips — the chip budget
@@ -3148,7 +3141,7 @@ fn model_row_meta_chips(row: &ModelPickerRow) -> Vec<String> {
         };
         chips.push(format!(
             "{} out{suffix}",
-            format_picker_context_window(u64::from(max_output))
+            format_context_window(u64::from(max_output))
         ));
     }
     // Modality and tool facts are shown only when the catalog genuinely knows
@@ -3226,13 +3219,11 @@ fn sort_model_rows_for_view<'a, T>(
     pins: &[PinnedModel],
 ) {
     use std::cmp::Reverse;
+    // Same route match as marking and labelling (`pin_names_row`), so a row
+    // never sorts into the pinned block without carrying its pin.
     let pin_rank = |row: &ModelPickerRow| {
-        row_provider_identity(row)
-            .and_then(|provider| {
-                pins.iter().position(|pin| {
-                    provider.eq_ignore_ascii_case(&pin.provider) && row.id == pin.model
-                })
-            })
+        pins.iter()
+            .position(|pin| pin_names_row(pin, row))
             .unwrap_or(usize::MAX)
     };
     match view {
@@ -3749,7 +3740,7 @@ fn render_picker_model_hint(
         if provider == Some(ApiProvider::OpenaiCodex) {
             parts.push(format!(
                 "{} ctx · ChatGPT route",
-                format_picker_context_window(u64::from(context_window))
+                format_context_window(u64::from(context_window))
             ));
         } else if provider == Some(ApiProvider::Moonshot)
             && id.trim().eq_ignore_ascii_case("k3")
@@ -3761,7 +3752,7 @@ fn render_picker_model_hint(
             // `context_window` setting when the plan includes 1M.
             parts.push(format!(
                 "{} ctx (plan floor; raise via context_window)",
-                format_picker_context_window(u64::from(context_window))
+                format_context_window(u64::from(context_window))
             ));
         } else {
             let suffix = if metadata.context_window_unverified {
@@ -3771,7 +3762,7 @@ fn render_picker_model_hint(
             };
             parts.push(format!(
                 "{} ctx{}",
-                format_picker_context_window(u64::from(context_window)),
+                format_context_window(u64::from(context_window)),
                 suffix
             ));
         }
@@ -3785,7 +3776,7 @@ fn render_picker_model_hint(
         };
         parts.push(format!(
             "{} out{}",
-            format_picker_context_window(u64::from(max_output)),
+            format_context_window(u64::from(max_output)),
             suffix
         ));
     }
@@ -3877,23 +3868,6 @@ fn catalog_refresh_error_label(error: CatalogRefreshError) -> &'static str {
         CatalogRefreshError::InvalidResponse => "invalid response",
         CatalogRefreshError::EmptyList => "empty list",
         CatalogRefreshError::Network => "network error",
-    }
-}
-
-pub(crate) fn format_picker_context_window(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        if tokens.is_multiple_of(1_000_000) {
-            format!("{}M", tokens / 1_000_000)
-        } else {
-            format!("{:.2}M", tokens as f64 / 1_000_000.0)
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string()
-        }
-    } else if tokens >= 1_000 {
-        format!("{}K", tokens / 1_000)
-    } else {
-        tokens.to_string()
     }
 }
 
@@ -4510,6 +4484,81 @@ pub(crate) fn picker_efforts_for_route(
     if model_is_auto {
         return AUTO_MODEL_PICKER_EFFORTS.to_vec();
     }
+    distinct_effective_efforts(
+        route_picker_efforts(provider, base_url, wire_model),
+        provider,
+        base_url,
+        wire_model,
+    )
+}
+
+/// The tier a concrete route receives for `effort`: the route-constrained
+/// receipt tier when the route's dialect is narrower than the generic
+/// normalization (Z.ai GLM, Kimi Code K3), otherwise
+/// [`ReasoningEffort::normalize_for_route`]. This is the effective tier the
+/// effort status line and Work receipts report, so the ladder and the cycler
+/// dedupe against the same value the operator sees.
+pub(crate) fn effective_tier_for_route(
+    effort: ReasoningEffort,
+    provider: ApiProvider,
+    base_url: &str,
+    wire_model: &str,
+) -> ReasoningEffort {
+    match crate::work_graph::constrained_effective_reasoning_for_route(
+        effort.into(),
+        provider,
+        base_url,
+        wire_model,
+    )
+    .map(crate::reasoning_preference::EffectiveReasoningEffort::from)
+    {
+        Some(crate::reasoning_preference::EffectiveReasoningEffort::Tier(tier)) => tier,
+        _ => effort.normalize_for_route(provider, base_url, wire_model),
+    }
+}
+
+/// Drop rungs that resolve to the same effective tier as another rung on the
+/// route (#6650). The picker and the Ctrl+T cycler walk this ladder, so a rung
+/// whose effective tier is already offered would be a row that changes
+/// nothing and a key press that does nothing — DeepSeek's `medium` lands on
+/// `high`, Z.ai GLM-5.2's `low` lands on `high`, an always-thinking route's
+/// `off` lands on its lowest tier, and a catalog `thinking: disabled` value
+/// the effort dialect cannot express lands on the catalog default. When two
+/// rungs collide, the one whose own value is the effective tier wins, so the
+/// row names what the route will receive. `Auto` always stays: it is the
+/// "leave it to the route" preference, not a tier, and is displayed as its
+/// own state. Routes whose effective tier cannot be proven (a custom endpoint,
+/// an enabled-but-untiered toggle) keep their rows.
+fn distinct_effective_efforts(
+    efforts: Vec<ReasoningEffort>,
+    provider: ApiProvider,
+    base_url: &str,
+    wire_model: &str,
+) -> Vec<ReasoningEffort> {
+    let effective =
+        |effort: ReasoningEffort| effective_tier_for_route(effort, provider, base_url, wire_model);
+    let mut seen = Vec::with_capacity(efforts.len());
+    let mut distinct = Vec::with_capacity(efforts.len());
+    for &effort in &efforts {
+        if effort == ReasoningEffort::Auto {
+            distinct.push(effort);
+            continue;
+        }
+        let tier = effective(effort);
+        if (tier != effort && efforts.contains(&tier)) || seen.contains(&tier) {
+            continue;
+        }
+        seen.push(tier);
+        distinct.push(effort);
+    }
+    distinct
+}
+
+fn route_picker_efforts(
+    provider: ApiProvider,
+    base_url: &str,
+    wire_model: &str,
+) -> Vec<ReasoningEffort> {
     // Exact-route overrides still win over catalog metadata: Kimi Code K3 and
     // OpenAI Codex have wire dialects the generic Models.dev shape does not
     // fully describe.
@@ -4567,12 +4616,17 @@ fn catalog_picker_efforts(provider: ApiProvider, wire_model: &str) -> Option<Vec
     let offering = catalog_offering_for_model(provider, wire_model)?;
     let mut efforts = Vec::new();
     let mut saw_effort_list = false;
+    let mut has_toggle = false;
     for option in &offering.reasoning_options {
         let option_type = option
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        if option_type == "toggle" {
+            has_toggle = true;
+            continue;
+        }
         // Prefer explicit effort lists; also accept thinking-mode lists whose
         // values map onto our tiers (adaptive→auto, disabled→off, always_on→max).
         if option_type != "effort" && option_type != "thinking" {
@@ -4595,6 +4649,11 @@ fn catalog_picker_efforts(provider: ApiProvider, wire_model: &str) -> Option<Vec
     }
     if !saw_effort_list || efforts.is_empty() {
         return None;
+    }
+    // A Models.dev `toggle` beside the ladder means reasoning can also be
+    // switched off (#6396).
+    if has_toggle && !efforts.contains(&ReasoningEffort::Off) {
+        efforts.insert(0, ReasoningEffort::Off);
     }
     // Always offer Auto when the catalog published discrete tiers so the
     // operator can still leave the choice to the route default. Do not invent
@@ -4682,6 +4741,33 @@ fn default_picker_effort_idx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_ladder_drops_rungs_that_resolve_to_an_offered_tier() {
+        use ReasoningEffort::*;
+        // DeepSeek collapses minimal/medium/xhigh/ultra onto low/high/max, so
+        // a catalog that published every spelling still shows one row per
+        // wire tier (#6650).
+        assert_eq!(
+            distinct_effective_efforts(
+                vec![Auto, Off, Minimal, Low, Medium, High, XHigh, Ultra, Max],
+                ApiProvider::Deepseek,
+                crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+                "deepseek-v4.1-flash",
+            ),
+            vec![Auto, Off, Low, High, Max]
+        );
+        // When the alias comes first, the rung that names the tier still wins.
+        assert_eq!(
+            distinct_effective_efforts(
+                vec![Auto, Medium, High, Max],
+                ApiProvider::Deepseek,
+                crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+                "deepseek-v4.1-flash",
+            ),
+            vec![Auto, High, Max]
+        );
+    }
 
     #[test]
     fn configured_model_picker_and_runtime_share_exact_persisted_metadata() {
@@ -4798,6 +4884,39 @@ mod tests {
         let builtin = model_row(ApiProvider::Deepseek, true);
         assert!(pin_names_row(&pin("deepseek"), &builtin));
         assert!(pin_names_row(&pin("DeepSeek"), &builtin));
+    }
+
+    /// The catalog sort ranks pins with the same exact match that marks them:
+    /// a `TeamA` pin must not lift an unmarked `teama` row into the pinned
+    /// block above the groups.
+    #[test]
+    fn catalog_sort_ranks_only_rows_the_pin_names() {
+        let pins = vec![PinnedModel {
+            provider: "TeamA".to_string(),
+            model: "model".to_string(),
+            label: None,
+        }];
+        let custom = |identity: &str| ModelPickerRow {
+            provider_identity: Some(identity.to_string()),
+            ..model_row(ApiProvider::Custom, true)
+        };
+        let owned = [
+            model_row(ApiProvider::Deepseek, true),
+            custom("teama"),
+            custom("TeamA"),
+        ];
+        let mut rows: Vec<&ModelPickerRow> = owned.iter().collect();
+        sort_model_rows_for_view(&mut rows, |row| *row, ModelListView::Catalog, &pins);
+
+        // Pinned `TeamA` leads; `teama` falls back to plain group order
+        // (after `deepseek`) instead of riding the pin into the top block.
+        let order: Vec<Option<&str>> = rows
+            .iter()
+            .map(|row| row.provider_identity.as_deref())
+            .collect();
+        assert_eq!(order, vec![Some("TeamA"), None, Some("teama")]);
+        assert!(pin_for_row(&pins, rows[0]).is_some());
+        assert!(pin_for_row(&pins, rows[2]).is_none());
     }
 
     #[test]
@@ -5350,14 +5469,17 @@ mod tests {
                 }
                 let mut picker = ModelPickerView::new(&app, &config);
                 let visible = picker.visible_model_rows();
-                // The current route leads (#6533); the pins follow it.
+                // The current route leads (#6533); the pins follow it. The
+                // configured `default_text_model` is the startup route, so the
+                // lower pin is also the current row.
+                assert_eq!(app.model, lower);
                 assert_eq!(visible[0].id, app.model);
-                assert_eq!(
-                    visible[1].id, lower,
+                let lower_index = visible.iter().position(|row| row.id == lower).unwrap();
+                let upper_index = visible.iter().position(|row| row.id == upper).unwrap();
+                assert!(
+                    lower_index < upper_index,
                     "saved pin order precedes lexical order"
                 );
-                assert_eq!(visible[2].id, upper);
-                let upper_index = visible.iter().position(|row| row.id == upper).unwrap();
                 drop(visible);
                 picker.selected_model_idx = upper_index;
                 picker.re_resolve_from_app(&app, &config);
@@ -5645,7 +5767,7 @@ mod tests {
         assert!(
             picker.projection.borrow().as_ref().unwrap().rows[index]
                 .meta
-                .contains(&format_picker_context_window(777_000))
+                .contains(&format_context_window(777_000))
         );
     }
 

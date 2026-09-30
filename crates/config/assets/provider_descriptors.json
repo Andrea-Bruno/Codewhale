@@ -10,6 +10,9 @@
       "api_key_env": "AICRAFT_API_KEY",
       "default_model": "claude-4.6-sonnet",
       "discovery": "models_endpoint",
+      "docs_url": "https://aicraftapi.com/docs.html#codewhale",
+      "credential_url": "https://aicraftapi.com/dashboard.html",
+      "guidance": "OpenAI-compatible host (Chat Completions + GET /v1/models). Live /v1/models is the model authority: the roster spans DeepSeek, Claude, Gemini, Qwen, GLM, MiniMax and Doubao ids. Store AICRAFT_API_KEY, not a raw key.",
       "aliases": [
         "ai-craft",
         "ai_craft"
@@ -99,6 +102,17 @@
         "meituan-sensenova",
         "meituan-sensenova-cn"
       ]
+    },
+    {
+      "id": "tsubasa",
+      "label": "Tsubasa",
+      "wire": "openai-compatible",
+      "base_url": "https://api.tsubasa.sh/v1",
+      "api_key_env": "TSUBASA_API_KEY",
+      "default_model": "tsubasa-pro",
+      "discovery": "models_endpoint",
+      "docs_url": "https://tsubasa.sh/docs",
+      "guidance": "OpenAI-compatible host (Chat Completions + GET /v1/models only). Public model ids: tsubasa-pro and tsubasa-fast, both with a 32,768-token context, so set context_window = 32768 on [providers.tsubasa]. Store TSUBASA_API_KEY, not a raw key."
     }
   ]
 }

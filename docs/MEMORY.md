@@ -1,5 +1,7 @@
 # User Memory
 
+> 阅读简体中文版：[zh_hans/MEMORY.md](zh_hans/MEMORY.md)。
+
 User memory gives the model a small, persistent, local store of
 preferences and conventions that should survive across sessions —
 "I prefer pytest over unittest", "this codebase uses 4-space
@@ -51,7 +53,7 @@ re-roots to `~/.codewhale/memory/`:
 ```
 
 The scope directory is `workspace` (singular) — `MemoryScope::directory`,
-`crates/tui/src/native_memory.rs:31-36`. The index filename is
+`crates/runtime/src/native_memory.rs:31-36`. The index filename is
 `index.sqlite3` (`native_memory.rs:175`).
 
 Markdown is the durable source of truth; `index.sqlite3` is a disposable

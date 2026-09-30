@@ -218,7 +218,7 @@ fn tool_error_to_wire(error: &ToolError) -> wire::ToolCallError {
             field: field.clone(),
         },
         ToolError::PathEscape { path } => wire::ToolCallError::PathEscape { path: path.clone() },
-        ToolError::ExecutionFailed { message } => wire::ToolCallError::ExecutionFailed {
+        ToolError::ExecutionFailed { message, .. } => wire::ToolCallError::ExecutionFailed {
             message: message.clone(),
         },
         ToolError::Timeout { seconds } => wire::ToolCallError::Timeout { seconds: *seconds },
@@ -486,7 +486,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             session_id,
             index: count(*index),
         },
-        Event::ToolCallStarted { id, name, input } => wire::EventMsg::ToolCallStarted {
+        Event::ToolCallStarted {
+            id, name, input, ..
+        } => wire::EventMsg::ToolCallStarted {
             thread_id,
             session_id,
             tool_call_id: id.clone(),
@@ -497,7 +499,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             thread_id,
             session_id,
         },
-        Event::ToolCallComplete { id, name, result } => wire::EventMsg::ToolCallComplete {
+        Event::ToolCallComplete {
+            id, name, result, ..
+        } => wire::EventMsg::ToolCallComplete {
             thread_id,
             session_id,
             tool_call_id: id.clone(),
@@ -545,6 +549,11 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             route: route.as_ref().map(route_to_wire),
         },
         Event::ToolRequestSnapshot { snapshot } => wire::EventMsg::ToolRequestSnapshot {
+            thread_id,
+            session_id,
+            snapshot: to_value(snapshot),
+        },
+        Event::WorkspaceSnapshotTaken { snapshot } => wire::EventMsg::WorkspaceSnapshotTaken {
             thread_id,
             session_id,
             snapshot: to_value(snapshot),
@@ -698,6 +707,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             spawn_depth,
             model,
             route_source,
+            display_name,
         } => wire::EventMsg::AgentSpawned {
             thread_id,
             session_id,
@@ -709,6 +719,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             spawn_depth: *spawn_depth,
             model: model.clone(),
             route_source: route_source.clone(),
+            display_name: display_name.clone(),
         },
         Event::AgentProgress {
             owner_session_id,
@@ -742,6 +753,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             // Child usage stays off the wire: no protocol client consumes
             // it, and metrics reads the persisted runtime payload (#6315).
             usage: _,
+            display_name,
         } => wire::EventMsg::AgentComplete {
             thread_id,
             session_id,
@@ -754,6 +766,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             parent_run_id: parent_run_id.clone(),
             spawn_depth: *spawn_depth,
             continuable: *continuable,
+            display_name: display_name.clone(),
         },
         Event::SubAgentFollowUp {
             owner_session_id,
@@ -1264,6 +1277,7 @@ mod tests {
             (None, None),
         ] {
             let event = Event::AgentComplete {
+                display_name: None,
                 owner_session_id: "owner".into(),
                 id: "worker".into(),
                 result: "Completed successfully".into(),
@@ -1407,17 +1421,20 @@ mod tests {
                 content: "hmm".into(),
             },
             Event::ToolCallStarted {
+                model_call: None,
                 id: "c1".into(),
                 name: "read_file".into(),
                 input: json!({"path": "x"}),
             },
             Event::ToolCallHeartbeat,
             Event::ToolCallComplete {
+                model_call: None,
                 id: "c1".into(),
                 name: "read_file".into(),
                 result: Ok(ToolResult::success("ok")),
             },
             Event::ToolCallComplete {
+                model_call: None,
                 id: "c2".into(),
                 name: "bash".into(),
                 result: Err(ToolError::Timeout { seconds: 9 }),
@@ -1435,6 +1452,17 @@ mod tests {
                 error: Some("stopped".into()),
                 tool_catalog: None,
                 base_url: Some("https://example.invalid".into()),
+            },
+            Event::WorkspaceSnapshotTaken {
+                snapshot: crate::snapshot::WorkspaceSnapshotRef {
+                    kind: crate::snapshot::WorkspaceSnapshotKind::Tool,
+                    snapshot_id: "a".repeat(40),
+                    tree_id: "b".repeat(40),
+                    session_id: "thr_1".into(),
+                    tool_call_id: Some("c1".into()),
+                    write_paths: Some(vec!["src/lib.rs".into()]),
+                    changed_paths: Some(Vec::new()),
+                },
             },
             Event::RoutedTurnUsage {
                 usage: usage.clone(),

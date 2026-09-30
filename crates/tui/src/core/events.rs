@@ -16,8 +16,17 @@ use crate::tools::subagent::{AgentWorkerStatus, CoordinationDetailProjection, Su
 use crate::tools::user_input::UserInputRequest;
 use codewhale_models::{Message, SystemPrompt, Tool, Usage};
 
+/// Provider correlation retained only for model-history reconstruction.
+/// Event ids remain host execution ids; this is not approval authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelToolCall {
+    pub provider_id: String,
+    pub caller: Option<codewhale_models::ToolCaller>,
+    pub thought_signature: Option<String>,
+}
+
 /// Final status for a turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnOutcomeStatus {
     Completed,
@@ -234,6 +243,7 @@ pub enum Event {
     /// Tool call initiated
     ToolCallStarted {
         id: String,
+        model_call: Option<ModelToolCall>,
         name: String,
         input: Value,
     },
@@ -248,6 +258,7 @@ pub enum Event {
     /// Tool call completed
     ToolCallComplete {
         id: String,
+        model_call: Option<ModelToolCall>,
         name: String,
         result: Result<ToolResult, ToolError>,
     },
@@ -279,6 +290,17 @@ pub enum Event {
     /// Delivery remains unknown; this event is emitted before connection setup.
     ToolRequestSnapshot {
         snapshot: crate::tool_inspection::ToolInspectionSnapshot,
+    },
+
+    /// The engine took a workspace snapshot for the running turn: before it
+    /// (`pre_turn`), before one file-modifying tool call (`tool`), after that
+    /// call (`post_tool`, recording hosts only), or after the turn
+    /// (`post_turn`). A host that records these on its turn records owns
+    /// exactly those restore points (see `crate::snapshot::WorkspaceSnapshotRef`).
+    /// With `EngineConfig::record_restore_points` every receipt of a turn
+    /// arrives before its `TurnComplete`.
+    WorkspaceSnapshotTaken {
+        snapshot: crate::snapshot::WorkspaceSnapshotRef,
     },
 
     /// Immutable billing route captured at CodeWhale's pre-permit application
@@ -443,6 +465,10 @@ pub enum Event {
         /// `run.model`, …). `None` for spawn paths that bypass route
         /// resolution (checkpoint resume, engine-internal spawns).
         route_source: Option<String>,
+        /// The name this agent goes by on every surface: its workflow task
+        /// label, dispatch name, or role, resolved once by the engine
+        /// (`subagent_display_name`). Never the raw id.
+        display_name: Option<String>,
     },
 
     /// Sub-agent progress update
@@ -468,6 +494,8 @@ pub enum Event {
         /// Provider-reported child usage from the durable ledger (#6315).
         /// None means the worker has no usage receipt, never zero tokens.
         usage: Option<crate::tools::subagent::AgentRunUsage>,
+        /// Same resolved name as `AgentSpawned::display_name`.
+        display_name: Option<String>,
     },
 
     /// Receipt for an operator follow-up sent to a child (`Op::FollowUpSubAgent`).
@@ -614,6 +642,15 @@ pub enum Event {
     },
 
     /// Request user decision after sandbox denial
+    // Consumers (TUI, runtime threads, exec agent, protocol parity) handle
+    // this, but the engine never emits it. It stayed "live" only because the
+    // deleted public `rlm::run_rlm_turn` put `Event` in the crate's public
+    // API (#6511). Whether to wire the emitter or drop the elevation flow is
+    // a separate product decision.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no engine emitter yet; tests construct it")
+    )]
     ElevationRequired {
         tool_id: String,
         tool_name: String,
@@ -858,7 +895,11 @@ pub fn status_visibility(message: &str) -> StatusVisibility {
     let approval_wait_row = (message.starts_with("Still waiting for tool approval on `")
         || message.starts_with("Still waiting for user input on `"))
         && message.ends_with("s — the turn is parked here until it is answered");
-    if scheduler_row || continuation_row || agent_resume_row || approval_wait_row {
+    // #6511: a nested sub-RLM's forwarded rounds are the record of model
+    // calls the parent never saw; keep them, collapsed.
+    let nested_rlm_row = message.starts_with(crate::rlm::bridge::NESTED_RLM_STATUS_PREFIX);
+    if scheduler_row || continuation_row || agent_resume_row || approval_wait_row || nested_rlm_row
+    {
         StatusVisibility::Internal
     } else {
         StatusVisibility::User

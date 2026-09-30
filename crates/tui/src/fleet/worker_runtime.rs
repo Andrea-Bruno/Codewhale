@@ -483,6 +483,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         worker_id: worker_id.to_string(),
         run_id: run_id.to_string(),
         parent_run_id: None,
+        workflow_run_id: None,
         session_name: Some(session_name),
         objective,
         role,
@@ -1426,9 +1427,11 @@ pub(crate) fn fleet_model_route_for_loadout(
 
 /// Apply exec hardening to a worker spec from fleet config (#3027).
 ///
-/// Filters tools against allowed/disallowed lists, caps max_steps to
-/// config's max_turns, and returns the objective with system prompt
-/// appended when configured.
+/// Filters tools against allowed/disallowed lists and caps max_steps to
+/// config's max_turns. `append_system_prompt` is deliberately not folded into
+/// the objective: the worker command delivers it once, as system prompt text,
+/// via `--append-system-prompt`, and the objective must stay identical to the
+/// persisted launch manifest prompt.
 pub fn apply_exec_hardening(
     mut spec: AgentWorkerSpec,
     exec: &codewhale_config::FleetExecConfig,
@@ -1466,14 +1469,6 @@ pub fn apply_exec_hardening(
         if !spec.runtime_profile.denied_tools.contains(rule) {
             spec.runtime_profile.denied_tools.push(rule.clone());
         }
-    }
-
-    // Append system prompt
-    if !exec.append_system_prompt.is_empty() {
-        spec.objective = format!(
-            "{}\n\n[Policy]\n{}",
-            spec.objective, exec.append_system_prompt
-        );
     }
 
     spec
@@ -1573,6 +1568,7 @@ fn profile_origin_label(origin: crate::fleet::roster::ProfileOrigin) -> &'static
         crate::fleet::roster::ProfileOrigin::Config => "config",
         crate::fleet::roster::ProfileOrigin::Personal => "personal",
         crate::fleet::roster::ProfileOrigin::Workspace => "workspace",
+        crate::fleet::roster::ProfileOrigin::ClaudeCode => "claude",
     }
 }
 
@@ -1622,9 +1618,9 @@ mod tests {
     fn explicit_deepseek_config() -> Config {
         Config {
             provider: Some("deepseek".to_string()),
-            api_key: Some("test-key".to_string()),
             ..Config::default()
         }
+        .with_legacy_root(Some("test-key".to_string()), None)
     }
 
     #[test]
@@ -4778,6 +4774,7 @@ mod tests {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "test".to_string(),
             role: None,
@@ -4809,6 +4806,7 @@ mod tests {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "test".to_string(),
             role: None,
@@ -4914,11 +4912,12 @@ mod tests {
     }
 
     #[test]
-    fn exec_hardening_appends_system_prompt() {
+    fn exec_hardening_leaves_policy_prompt_out_of_the_objective() {
         let spec = AgentWorkerSpec {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "do the thing".to_string(),
             role: None,
@@ -4941,8 +4940,8 @@ mod tests {
             ..Default::default()
         };
         let hardened = apply_exec_hardening(spec, &exec);
-        assert!(hardened.objective.contains("do the thing"));
-        assert!(hardened.objective.contains("[Policy]"));
-        assert!(hardened.objective.contains("never push to main"));
+        // The policy travels as system prompt text on the worker command
+        // (`--append-system-prompt`), never duplicated into the task prompt.
+        assert_eq!(hardened.objective, "do the thing");
     }
 }

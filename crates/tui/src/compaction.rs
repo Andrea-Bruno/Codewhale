@@ -3,6 +3,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::DEFAULT_TEXT_MODEL;
@@ -65,9 +66,20 @@ pub struct CompactionConfig {
     pub retained_user_message_tokens: usize,
 }
 
+/// Host callback for user-visible progress during a compaction pass.
+///
+/// Compaction runs inside the engine's provider boundary, where the engine
+/// owns the only channel that reaches the person. Injecting a sink lets a
+/// downgrade (re-encoding images after an HTTP 413, say) say what it is doing
+/// while it is doing it, instead of surfacing only when the pass ends.
+pub trait CompactionNoticeSink: Send + Sync + std::fmt::Debug {
+    /// Deliver one already-rendered, user-visible sentence.
+    fn notice(&self, message: String);
+}
+
 /// Host-prepared configuration carried from compaction eligibility through
 /// the replacement-history commit.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct PreparedCompactionEnvelope {
     pub config: CompactionConfig,
     /// Durable handoff owner; set by the engine, never added to the stable prefix.
@@ -80,6 +92,33 @@ pub struct PreparedCompactionEnvelope {
     /// request that omits it shares no cacheable prefix with the turn it
     /// summarizes and re-bills the whole history uncached.
     pub reasoning_effort: Option<String>,
+    /// User-visible progress sink supplied by the host that owns the run
+    /// (the interactive engine, typically). `None` keeps every notice in the
+    /// log only — the pass itself never depends on it.
+    pub notice_sink: Option<Arc<dyn CompactionNoticeSink>>,
+}
+
+impl std::fmt::Debug for PreparedCompactionEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedCompactionEnvelope")
+            .field("config", &self.config)
+            .field("session_id", &self.session_id)
+            .field("tools", &self.tools)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("notice_sink", &self.notice_sink.as_ref().map(|_| "<sink>"))
+            .finish()
+    }
+}
+
+impl PartialEq for PreparedCompactionEnvelope {
+    /// The notice sink is host plumbing, not envelope content: two passes over
+    /// the same config are equal whether or not their host delivers notices.
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.session_id == other.session_id
+            && self.tools == other.tools
+            && self.reasoning_effort == other.reasoning_effort
+    }
 }
 
 impl PreparedCompactionEnvelope {
@@ -90,6 +129,7 @@ impl PreparedCompactionEnvelope {
             session_id: None,
             tools: None,
             reasoning_effort: None,
+            notice_sink: None,
         }
     }
 }
@@ -132,8 +172,8 @@ impl Default for CompactionConfig {
 /// scorer.
 const COMPACTION_LANGUAGE_CONTRACT: &str = "Use the natural language of the most recent \
 substantive user message for reasoning and user-facing prose. Keep code, identifiers, paths, \
-commands, logs, tool payloads, quotations, and the English structural labels verbatim. English \
-scaffolding is not a request to switch languages.";
+commands, logs, tool payloads, quotations, and the English headings verbatim. English \
+headings are not a request to switch languages.";
 
 /// Failure kind for compaction LLM calls (deterministic vs transient).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,44 +207,173 @@ const RETAINED_TOOL_RESULT_MAX_CHARS: usize = 64 * 1024;
 pub(crate) const COMPACT_RETAINED_USER_MESSAGE_MAX_TOKENS: usize =
     crate::config::DEFAULT_COMPACTION_RETAINED_USER_MESSAGE_TOKENS;
 /// Handoff summarization prompt, appended to the live conversation as the
-/// final user message (ported from Codex `templates/compact/prompt.md`).
-const COMPACT_PROMPT: &str = "You are performing a context checkpoint compaction. Create a \
-handoff summary for another LLM that will resume the task.\n\nInclude:\n\
-- Current progress and key decisions made\n\
-- Important context, constraints, or user preferences\n\
-- What remains to be done (clear next steps)\n\
-- The user's current objective, latest corrections, and already-granted permissions or explicit prohibitions\n\
-- Active commands, task and session handles, changed files, and the exact verification still needed\n\
-- Any critical data, examples, or references needed to continue (exact file paths, commands, and error text)\n\n\
-Be concise, structured, and focused on helping the next LLM seamlessly continue the work. Do not call tools.\n\
-Summarize the task, not the checkpoint machinery: do not mention compaction, checkpoints, or \
-context management, and do not carry forward meta-commentary about them (e.g. \"context intact\") \
-from earlier turns.";
+/// final user message. The headings are requested, not enforced:
+/// `validate_compaction_summary` only rejects corrupt output, so a provider
+/// that drifts from the layout still produces a usable note.
+pub(crate) const COMPACT_PROMPT_OPENING: &str = "Write a handoff note so this session's work can \
+continue after its earlier turns are condensed to make room.";
 
-/// Preamble for the one conversation-history checkpoint created by compaction.
-/// This intentionally follows Codex's `templates/compact/summary_prefix.md`:
-/// the checkpoint is a user-history item, never standing system-prompt prose.
-const SUMMARY_HEADER: &str = "Another language model started to solve this problem and produced \
-a summary of its thinking process. You also have access to the state of the tools that were used \
-by that language model. Use this to build on the work that has already been done and avoid \
-duplicating work. Here is the summary produced by the other language model, use the information \
-in this summary to assist with your own analysis:";
+/// The note's layout, shared by the first request and the quality retry.
+/// Each entry is a heading and what belongs under it.
+const HANDOFF_SECTIONS: [(&str, &str); 10] = [
+    (
+        "Objective",
+        "what the user wants now, in their words where it matters; say if the goal changed and \
+what replaced it.",
+    ),
+    (
+        "User direction",
+        "corrections, preferences and decisions, newest last; quote exactly anything the user \
+corrected or insisted on.",
+    ),
+    (
+        "Permissions and limits",
+        "what the user explicitly allowed (pushing, deleting, spending, contacting someone) and \
+what they ruled out. Record only what the user said; never infer a permission.",
+    ),
+    (
+        "Done",
+        "finished work with evidence: commands and results, commits, test counts. Separate \
+verified from assumed.",
+    ),
+    (
+        "Changed files",
+        "each path and its state: edited, created or deleted; committed or not; which branch.",
+    ),
+    (
+        "Still running",
+        "shell commands, servers and ports started in this session that may still be live, each \
+with the command or ID that checks or stops it. Leave agents out; their status is reported \
+separately.",
+    ),
+    (
+        "Verification left",
+        "exact commands or checks still needed, and the last failure verbatim.",
+    ),
+    (
+        "Open questions",
+        "what waits on the user or is undecided, and what it blocks.",
+    ),
+    (
+        "Next action",
+        "the one next step, concrete enough to start without rereading history.",
+    ),
+    (
+        "Reference",
+        "exact paths, identifiers, URLs, values and short snippets the work depends on.",
+    ),
+];
 
-/// Detection marker for committed compaction-summary text: the stable first
-/// sentence of [`SUMMARY_HEADER`]. `engine/context.rs` restores summaries by
-/// the same marker on session load.
-pub const COMPACTION_SUMMARY_MARKER: &str = "Another language model started to solve this problem";
-/// Marker written by pre-v0.9.6 compaction; sessions saved under the old
-/// format must still be recognized so their summary is replaced, not stacked.
+const HANDOFF_FOLD_IN_RULE: &str = "If the history already holds an earlier handoff note, fold \
+it in: carry forward what is still true, update what later work changed, and drop what is \
+finished or superseded. Keep quoted user wording exact rather than paraphrasing it again. Do not \
+copy the note's opening or closing lines or the user-pinned anchors; Codewhale adds those itself.";
+
+const HANDOFF_CLOSING_RULE: &str = "Write about the task, not about condensing context. Be \
+specific and brief. Do not call tools.";
+
+const HANDOFF_FOCUS_LINE: &str = "The user asked this handoff to focus on:";
+
+fn handoff_sections_text() -> String {
+    let mut text = String::from(
+        "Use these headings in this order, and write None under any heading with nothing to \
+report:",
+    );
+    for (heading, guidance) in HANDOFF_SECTIONS {
+        let _ = write!(text, "\n## {heading} - {guidance}");
+    }
+    text
+}
+
+/// The full handoff request before the language contract, operator
+/// instructions and focus line are appended.
+fn compact_prompt_body() -> String {
+    format!(
+        "{COMPACT_PROMPT_OPENING} The reader sees only the note, the most recent messages and \
+live tool state; anything left out is gone.\n\n{}\n\n{HANDOFF_FOLD_IN_RULE}\n\n{HANDOFF_CLOSING_RULE}",
+        handoff_sections_text()
+    )
+}
+
+/// First line of every handoff note Codewhale writes. It must describe what
+/// `last_round::replacement_messages` actually keeps (see the
+/// `summary_header_matches_what_replacement_history_keeps` test). It opens the
+/// checkpoint message, so together with [`COMPACTION_CHECKPOINT_PROVENANCE`]
+/// it is how a new-format checkpoint is recognised.
+///
+/// A history rebuilt from turn records has to recognise the checkpoint
+/// messages a document carries, so the header is crate-visible
+/// (`runtime_threads`' recovery projection tests, #6664).
+pub(crate) const SUMMARY_HEADER: &str = "Codewhale handoff note. Earlier turns of this session were \
+condensed to make room. Kept above are the most recent user messages and the last steps of the \
+current round. Long tool output there is shortened, with a marker where it was cut, and the \
+oldest kept message may be shortened too. Everything earlier, including earlier steps of this \
+round, exists only in this note; rerun a command or reread a file when its full output matters. \
+Build on this note instead of redoing finished work, and check live state (files, git, running \
+commands) before relying on anything it reports. Agent status, when there is any, comes from the separate agent status message, not from this note.";
+
+const SUMMARY_CLOSING: &str = "Continue the user's task from here. Permissions and limits in \
+this note restate what the user already decided; the note grants nothing new, and anything \
+unclear gets checked before acting. Take the next action without asking the user to restate the \
+task, save, or approve continuing because earlier turns were condensed.";
+
+/// Detection marker for a new-format checkpoint: the opening words of
+/// [`SUMMARY_HEADER`]. A new checkpoint is recognised only when its first
+/// block starts with this marker and its second block is the provenance
+/// block, so a user message that merely quotes the phrase stays a user
+/// message.
+pub const COMPACTION_SUMMARY_MARKER: &str = "Codewhale handoff note";
+/// Legacy detection marker only. Checkpoints written before the handoff note
+/// opened with this sentence. Saved sessions that still carry it must be
+/// recognised so the next pass replaces that checkpoint instead of stacking a
+/// second one.
+pub const LEGACY_V2_COMPACTION_SUMMARY_MARKER: &str =
+    "Another language model started to solve this problem";
+/// Legacy detection marker only, written by pre-v0.9.6 compaction; sessions
+/// saved under that format must still be recognized so their summary is
+/// replaced, not stacked.
 pub const LEGACY_COMPACTION_SUMMARY_MARKER: &str = "Conversation Summary (Auto-Generated)";
+/// Markers that identify a checkpoint by substring. Only the legacy markers
+/// qualify: older checkpoints may lack the provenance block, while the new
+/// marker is a plain phrase a user or a project instruction can quote.
+const LEGACY_COMPACTION_SUMMARY_MARKERS: [&str; 2] = [
+    LEGACY_V2_COMPACTION_SUMMARY_MARKER,
+    LEGACY_COMPACTION_SUMMARY_MARKER,
+];
 const COMPACTION_CHECKPOINT_PROVENANCE: &str = "<!-- codewhale.compaction-checkpoint.v1 -->";
 const COMPACTION_SUMMARY_BEGIN: &str = "<!-- compaction-summary:begin -->";
 const COMPACTION_SUMMARY_END: &str = "<!-- compaction-summary:end -->";
 
-/// Whether a system-prompt text block is a committed compaction summary.
-#[must_use]
-pub fn is_compaction_summary_text(text: &str) -> bool {
-    text.contains(COMPACTION_SUMMARY_MARKER) || text.contains(LEGACY_COMPACTION_SUMMARY_MARKER)
+/// Heading the pre-v0.9.6 builder wrote, optionally after a
+/// `## Pinned Facts (User Anchors)` section.
+const LEGACY_SUMMARY_HEADING: &str = "## 📋 Conversation Summary (Auto-Generated)";
+const LEGACY_ANCHORS_HEADING: &str = "## Pinned Facts (User Anchors)";
+
+/// Whether text opens the way a legacy checkpoint opened. A message that only
+/// quotes a marker later in its text is the user's, not a checkpoint (#6680).
+/// Pre-v0.9.6 checkpoints opened with [`LEGACY_SUMMARY_HEADING`], or with the
+/// pinned-anchors section followed by that heading on its own line.
+fn is_legacy_compaction_summary_text(text: &str) -> bool {
+    let text = text.trim_start();
+    LEGACY_COMPACTION_SUMMARY_MARKERS
+        .iter()
+        .any(|marker| text.starts_with(marker))
+        || text.starts_with(LEGACY_SUMMARY_HEADING)
+        || (text.starts_with(LEGACY_ANCHORS_HEADING)
+            && text
+                .lines()
+                .any(|line| line.trim_end() == LEGACY_SUMMARY_HEADING))
+}
+
+/// Byte offset of the earliest legacy marker in `text`. New-format carriers
+/// are always wrapped in the begin/end delimiters, so a bare new marker in a
+/// system prompt is host text (for example a project instruction quoting it)
+/// and must not truncate the prompt.
+fn legacy_summary_start(text: &str) -> Option<usize> {
+    LEGACY_COMPACTION_SUMMARY_MARKERS
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
 }
 
 fn summary_section(text: &str) -> Option<&str> {
@@ -225,10 +394,7 @@ fn strip_summary_text(mut text: String) -> Option<String> {
             });
         text.replace_range(begin..end, "");
     }
-    if let Some(marker) = text
-        .find(COMPACTION_SUMMARY_MARKER)
-        .or_else(|| text.find(LEGACY_COMPACTION_SUMMARY_MARKER))
-    {
+    if let Some(marker) = legacy_summary_start(&text) {
         text.truncate(marker);
     }
     let text = text.trim().to_string();
@@ -243,11 +409,7 @@ pub fn extract_compaction_summary(prompt: Option<&SystemPrompt>) -> Option<Syste
     match prompt? {
         SystemPrompt::Text(text) => summary_section(text)
             .map(str::to_string)
-            .or_else(|| {
-                text.find(COMPACTION_SUMMARY_MARKER)
-                    .or_else(|| text.find(LEGACY_COMPACTION_SUMMARY_MARKER))
-                    .map(|start| text[start..].trim().to_string())
-            })
+            .or_else(|| legacy_summary_start(text).map(|start| text[start..].trim().to_string()))
             .map(SystemPrompt::Text),
         SystemPrompt::Blocks(blocks) => {
             let blocks = blocks
@@ -256,10 +418,7 @@ pub fn extract_compaction_summary(prompt: Option<&SystemPrompt>) -> Option<Syste
                     let text = summary_section(&block.text)
                         .map(str::to_string)
                         .or_else(|| {
-                            block
-                                .text
-                                .find(COMPACTION_SUMMARY_MARKER)
-                                .or_else(|| block.text.find(LEGACY_COMPACTION_SUMMARY_MARKER))
+                            legacy_summary_start(&block.text)
                                 .map(|start| block.text[start..].trim().to_string())
                         })?;
                     let mut summary = block.clone();
@@ -326,13 +485,20 @@ pub(crate) fn compaction_checkpoint_message(prompt: &SystemPrompt) -> Message {
     }
 }
 
+/// Whether a history message is a compaction checkpoint. New-format
+/// checkpoints are recognised only structurally (see
+/// [`is_wire_compaction_checkpoint_message`]); substring matching is kept for
+/// the two legacy markers, whose older checkpoints may lack provenance.
 #[must_use]
 pub(crate) fn is_compaction_checkpoint_message(message: &Message) -> bool {
-    user_text_of(message).is_some_and(|text| is_compaction_summary_text(&text))
+    is_wire_compaction_checkpoint_message(message)
+        || user_text_of(message).is_some_and(|text| is_legacy_compaction_summary_text(&text))
 }
 
-/// Request-time recognition is narrower than legacy summary replacement:
-/// user text merely quoting the marker must keep its original wire position.
+/// Request-time recognition: exactly the header text block plus the
+/// provenance block. User text merely quoting a marker keeps its original
+/// wire position. Checkpoints saved before the handoff note still pass, so
+/// their position survives restore and the next pass replaces them.
 pub(crate) fn is_wire_compaction_checkpoint_message(message: &Message) -> bool {
     let [
         ContentBlock::Text {
@@ -348,7 +514,8 @@ pub(crate) fn is_wire_compaction_checkpoint_message(message: &Message) -> bool {
         return false;
     };
     message.role == Role::User
-        && text.starts_with(SUMMARY_HEADER)
+        && (text.starts_with(COMPACTION_SUMMARY_MARKER)
+            || text.starts_with(LEGACY_V2_COMPACTION_SUMMARY_MARKER))
         && provenance == COMPACTION_CHECKPOINT_PROVENANCE
 }
 
@@ -365,9 +532,12 @@ pub(crate) fn restore_compaction_checkpoint(
         messages.retain(|message| !is_wire_compaction_checkpoint_message(message));
         index
     } else {
-        // Legacy sessions have no independent provenance. Preserve their
-        // existing broad cleanup behavior; identical user text is ambiguous.
-        messages.retain(|message| !is_compaction_checkpoint_message(message));
+        // Legacy sessions have no independent provenance. Only replace
+        // header-prefixed messages when a saved checkpoint exists; identical
+        // user text is still ambiguous in that legacy format.
+        if checkpoint.is_some() {
+            messages.retain(|message| !is_compaction_checkpoint_message(message));
+        }
         messages.len()
     };
     if let Some(checkpoint) = checkpoint {
@@ -748,22 +918,33 @@ fn tool_args_preview(input: &serde_json::Value) -> String {
     truncate_chars(&raw, 120).to_string()
 }
 
-fn collect_tool_uses(messages: &[Message]) -> HashMap<String, ToolUseInfo> {
+fn collect_tool_uses(
+    messages: &[Message],
+) -> HashMap<codewhale_models::ToolCallKey<'_>, Option<(&str, ToolUseInfo)>> {
     let mut tool_uses = HashMap::new();
     for message in messages {
         for block in &message.content {
             if let ContentBlock::ToolUse {
                 id, name, input, ..
             } = block
+                && let Some(key) = block.tool_call_key()
+                && !key.as_str().trim().is_empty()
             {
-                tool_uses.insert(
-                    id.clone(),
-                    ToolUseInfo {
-                        name: name.clone(),
-                        key: tool_use_key(name, input),
-                        args_preview: tool_args_preview(input),
-                    },
-                );
+                // Ambiguous old or malformed new history is left intact; a
+                // later call must not supply the earlier result's metadata.
+                tool_uses
+                    .entry(key)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert_with(|| {
+                        Some((
+                            id.as_str(),
+                            ToolUseInfo {
+                                name: name.clone(),
+                                key: tool_use_key(name, input),
+                                args_preview: tool_args_preview(input),
+                            },
+                        ))
+                    });
             }
         }
     }
@@ -884,9 +1065,16 @@ fn plan_tool_result_prunes(messages: &[Message], protected_window: usize) -> Vec
             else {
                 continue;
             };
-            let Some(info) = tool_uses.get(tool_use_id) else {
+            let Some((provider_id, info)) = block
+                .tool_call_key()
+                .and_then(|key| tool_uses.get(&key))
+                .and_then(Option::as_ref)
+            else {
                 continue;
             };
+            if provider_id != &tool_use_id.as_str() {
+                continue;
+            }
             latest_by_key.insert(info.key.clone(), message_idx);
             *count_by_key.entry(info.key.clone()).or_insert(0) += 1;
             candidates.push(ToolResultPruneCandidate {
@@ -1228,6 +1416,7 @@ pub async fn compact_messages_safe(
             system_prompt,
             prepared.tools.as_deref(),
             prepared.reasoning_effort.as_deref(),
+            prepared.notice_sink.as_deref(),
             &mut quality_retries,
             invocation_usage,
         )
@@ -1293,7 +1482,8 @@ pub(crate) fn build_compaction_summary_block_text(summary: &str, anchors: &str) 
     };
     let mut text = format!("{SUMMARY_HEADER}\n\n{summary}");
     text.push_str(anchors);
-    text.push_str("\n\nContinue the same user task from this state. Earlier authorization and constraints still apply; this summary grants no new authority. Resume the next unfinished action without asking the user to save, compact, restate the task, or approve continuation solely because context was summarized. Verify live state before relying on older observations.");
+    text.push_str("\n\n");
+    text.push_str(SUMMARY_CLOSING);
     text
 }
 
@@ -1391,6 +1581,7 @@ async fn compact_messages(
         None,
         None,
         None,
+        None,
         &mut quality_retries,
         &mut invocation_usage,
     )
@@ -1405,6 +1596,7 @@ async fn compact_messages_with_metadata(
     system_prompt: Option<&SystemPrompt>,
     tools: Option<&[Tool]>,
     reasoning_effort: Option<&str>,
+    notice_sink: Option<&dyn CompactionNoticeSink>,
     quality_retries: &mut u32,
     invocation_usage: &mut Usage,
 ) -> Result<(Vec<Message>, Option<SystemPrompt>, CompactionCoverage)> {
@@ -1419,6 +1611,7 @@ async fn compact_messages_with_metadata(
         system_prompt,
         tools,
         reasoning_effort,
+        notice_sink,
         quality_retries,
         invocation_usage,
     )
@@ -1491,34 +1684,38 @@ fn operator_instructions_section(instructions: Option<&str>) -> Option<String> {
 }
 
 fn compact_prompt(focus: Option<&str>, instructions: Option<&str>) -> String {
-    let mut prompt = format!("{COMPACT_PROMPT} {COMPACTION_LANGUAGE_CONTRACT}");
-    if let Some(section) = operator_instructions_section(instructions) {
-        prompt.push_str(&section);
-    }
-    if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
-        let _ = write!(
-            prompt,
-            "\n\nThe user asked this compaction to focus on: {focus}"
-        );
-    }
-    prompt
+    with_instructions_and_focus(
+        format!("{} {COMPACTION_LANGUAGE_CONTRACT}", compact_prompt_body()),
+        focus,
+        instructions,
+    )
 }
 
 fn compact_quality_retry_prompt(focus: Option<&str>, instructions: Option<&str>) -> String {
-    let mut prompt = format!(
-        "The previous handoff response was empty or a placeholder. Return a substantive factual \
-continuation handoff. State the user objective, completed and current work, hard constraints, verified \
-evidence, unresolved failures, and the single next action. Do not refuse, call tools, discuss \
-checkpoint machinery, or return a placeholder. {COMPACTION_LANGUAGE_CONTRACT}"
-    );
+    with_instructions_and_focus(
+        format!(
+            "The previous reply was empty or a placeholder, so there is still no handoff note. \
+Write it now, with real content from this session under each heading.\n\n{}\n\n\
+{HANDOFF_FOLD_IN_RULE}\n\n{HANDOFF_CLOSING_RULE} Do not refuse or return a placeholder. \
+{COMPACTION_LANGUAGE_CONTRACT}",
+            handoff_sections_text()
+        ),
+        focus,
+        instructions,
+    )
+}
+
+/// Standing operator instructions first, then the one-off `/compact <focus>`.
+fn with_instructions_and_focus(
+    mut prompt: String,
+    focus: Option<&str>,
+    instructions: Option<&str>,
+) -> String {
     if let Some(section) = operator_instructions_section(instructions) {
         prompt.push_str(&section);
     }
     if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
-        let _ = write!(
-            prompt,
-            "\n\nThe user asked this compaction to focus on: {focus}"
-        );
+        let _ = write!(prompt, "\n\n{HANDOFF_FOCUS_LINE} {focus}");
     }
     prompt
 }
@@ -1560,21 +1757,41 @@ fn validate_compaction_summary(summary: &str) -> Result<()> {
 }
 
 /// Drop the oldest history message before retrying an over-window summary
-/// request (Codex parity: `history.remove_first_item()`), plus any tool
-/// results the removal orphans — strict providers reject unpaired results.
-fn drop_oldest_history_messages(messages: &mut Vec<Message>) {
-    if messages.len() <= 1 {
-        return;
+/// request, plus any tool results the removal orphans (strict providers
+/// reject unpaired results). `messages` ends with the handoff instruction.
+///
+/// The newest checkpoint is never dropped: it carries the previous handoff
+/// note, and without it the fold-in has nothing to carry forward, so user
+/// corrections and limits would vanish without notice. Returns `false`, having
+/// changed nothing, when no other history message can go and at least one
+/// would remain; the caller then fails the pass instead of summarizing
+/// without the note.
+fn drop_oldest_history_messages(messages: &mut Vec<Message>) -> bool {
+    let instruction = messages.len().saturating_sub(1);
+    let history = &messages[..instruction];
+    let mut keep = history
+        .iter()
+        .rposition(is_wire_compaction_checkpoint_message);
+    let Some(index) = (0..instruction).find(|&index| Some(index) != keep) else {
+        return false;
+    };
+    if history.len() <= 1 {
+        return false;
     }
-    messages.remove(0);
-    while messages.len() > 1
-        && messages[0]
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    messages.remove(index);
+    if keep.is_some_and(|keep_at| keep_at > index) {
+        keep = keep.map(|keep_at| keep_at - 1);
+    }
+    while index + 1 < messages.len()
+        && Some(index) != keep
+        && messages[index].content.iter().any(is_orphaned_result_block)
     {
-        messages.remove(0);
+        messages.remove(index);
+        if keep.is_some_and(|keep_at| keep_at > index) {
+            keep = keep.map(|keep_at| keep_at - 1);
+        }
     }
+    true
 }
 
 /// The summary request for one compaction pass: the parent turn's exact
@@ -1629,6 +1846,7 @@ async fn create_summary(
     system_prompt: Option<&SystemPrompt>,
     tools: Option<&[Tool]>,
     reasoning_effort: Option<&str>,
+    notice_sink: Option<&dyn CompactionNoticeSink>,
     quality_retries: &mut u32,
     invocation_usage: &mut Usage,
 ) -> Result<String> {
@@ -1658,6 +1876,12 @@ async fn create_summary(
     });
 
     let mut quality_retry_used = false;
+    // Request-size ladder: an HTTP 413 caps the request *body*, which the
+    // token-side budget cannot predict (a flat per-image token estimate can
+    // hide megabytes of base64). A refused summary call gets two byte-side
+    // downgrades before it fails — re-encode the inline images smaller, then
+    // replace them with text notes — each followed by exactly one retry.
+    let mut size_ladder = RequestSizeLadder::Start;
     loop {
         // Codex compaction is a normal model generation over the existing
         // cached prefix. Do the same here: the resolved route decides how
@@ -1678,14 +1902,92 @@ async fn create_summary(
         let cost_scope = crate::cost_status::scope_token();
         let response = match client.create_message(request).await {
             Ok(response) => response,
-            Err(err) if is_context_window_error(&err) && request_messages.len() > 2 => {
+            // A byte-side size rejection can also read like a length problem
+            // (gateway HTML pages carry their own wording); the size ladder
+            // owns it, not the drop-oldest ladder.
+            Err(err) if !is_request_too_large_error(&err) && is_context_window_error(&err) => {
+                if !drop_oldest_history_messages(&mut request_messages) {
+                    logging::warn(
+                        "Compaction summary input is over the context window with nothing \
+                         left to drop but the previous handoff note; the pass fails instead \
+                         of losing that note",
+                    );
+                    return Err(err);
+                }
                 logging::warn(format!(
                     "Compaction summary input over the context window ({err}); \
-                     dropping the oldest history item and retrying"
+                     dropped the oldest history item and retrying"
                 ));
-                drop_oldest_history_messages(&mut request_messages);
                 continue;
             }
+            Err(err) if is_request_too_large_error(&err) => match size_ladder {
+                RequestSizeLadder::Start => {
+                    // Decoding, resizing and re-encoding megabytes of inline
+                    // images is CPU-bound work; run it off the async worker so
+                    // the engine keeps servicing events while it happens.
+                    let mut outbound = std::mem::take(&mut request_messages);
+                    let joined = tokio::task::spawn_blocking(move || {
+                        let shrunk = crate::image_attach::shrink_images_for_request(&mut outbound);
+                        (outbound, shrunk)
+                    })
+                    .await;
+                    let (outbound, shrunk) = match joined {
+                        Ok(joined) => joined,
+                        Err(join_error) => {
+                            return Err(err.context(format!(
+                                "The summary request exceeded the provider's request-body limit and re-encoding its inline images failed: {join_error}"
+                            )));
+                        }
+                    };
+                    request_messages = outbound;
+                    if shrunk.images_seen == 0 {
+                        return Err(err.context(
+                            "The summary request exceeded the provider's request-body limit and the history carries no inline images to re-encode",
+                        ));
+                    }
+                    size_ladder = RequestSizeLadder::ImagesShrunk;
+                    if shrunk.images > 0 {
+                        let message = format!(
+                            "Making room exceeded the provider's request-body limit (HTTP 413); re-encoded {} inline image(s) smaller ({} to {}) and is retrying the summary.",
+                            shrunk.images,
+                            crate::image_attach::human_bytes(shrunk.bytes_before),
+                            crate::image_attach::human_bytes(shrunk.bytes_after),
+                        );
+                        logging::warn(&message);
+                        deliver_compaction_notice(notice_sink, message);
+                        continue;
+                    }
+                    // Images are present but every one already fits its share of
+                    // the byte budget, and the body was still refused: the cap
+                    // sits below the budget. A retry would send identical bytes,
+                    // so replace the images now instead of failing the pass.
+                    if let Err(replace_error) =
+                        replace_inline_images_for_retry(&mut request_messages, notice_sink)
+                    {
+                        return Err(err.context(format!(
+                            "The summary request exceeded the provider's request-body limit; {replace_error}"
+                        )));
+                    }
+                    size_ladder = RequestSizeLadder::ImagesReplaced;
+                    continue;
+                }
+                RequestSizeLadder::ImagesShrunk => {
+                    if let Err(replace_error) =
+                        replace_inline_images_for_retry(&mut request_messages, notice_sink)
+                    {
+                        return Err(err.context(format!(
+                            "The summary request still exceeded the provider's request-body limit and {replace_error}"
+                        )));
+                    }
+                    size_ladder = RequestSizeLadder::ImagesReplaced;
+                    continue;
+                }
+                RequestSizeLadder::ImagesReplaced => {
+                    return Err(err.context(
+                        "The summary request exceeded the provider's request-body limit even after re-encoding and then replacing every inline image",
+                    ));
+                }
+            },
             Err(err) => return Err(err),
         };
 
@@ -1771,6 +2073,75 @@ no replacement checkpoint was committed",
     }
 }
 
+/// How far the request-size ladder for one summary call has descended.
+///
+/// The ladder exists because HTTP 413 rejects the request *body* by bytes,
+/// which the token-side context budget that governs compaction cannot see.
+/// Each rung is one retry: re-encode the inline images under a byte budget,
+/// then replace them with text notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestSizeLadder {
+    /// No size downgrade applied yet.
+    Start,
+    /// Inline images were re-encoded smaller.
+    ImagesShrunk,
+    /// Inline images were replaced with text notes.
+    ImagesReplaced,
+}
+
+/// Whether the provider refused the request body for size (HTTP 413 and its
+/// common wordings). A smaller payload can succeed where this one did not,
+/// which is exactly what the request-size ladder trades on.
+///
+/// Walks the whole error chain: the rejection may be stated by a fronting
+/// gateway (an HTML page from openresty reading "413 Request Entity Too
+/// Large") and then wrapped again by the client's own error text, so the
+/// top-level message alone is not reliable.
+fn is_request_too_large_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let lower = cause.to_string().to_lowercase();
+        // The client always renders the status code into the message
+        // ("HTTP 413"), so that token is the primary signal; the phrase list
+        // below catches gateways that state the condition without it.
+        lower.contains("http 413")
+            || lower.contains("payload too large")
+            || lower.contains("request entity too large")
+            || lower.contains("request body too large")
+            || lower.contains("length limit exceeded")
+    })
+}
+
+/// Forward one user-visible progress sentence, when the host supplied a sink.
+fn deliver_compaction_notice(sink: Option<&dyn CompactionNoticeSink>, message: String) {
+    if let Some(sink) = sink {
+        sink.notice(message);
+    }
+}
+
+/// Replace every inline image for one retry and announce it.
+///
+/// Shared by the two rungs that can reach the replace step: after a shrink
+/// pass that changed something, and directly when the images already fit the
+/// byte budget but the body was refused anyway.
+fn replace_inline_images_for_retry(
+    messages: &mut [Message],
+    notice_sink: Option<&dyn CompactionNoticeSink>,
+) -> Result<usize> {
+    let replaced = crate::image_attach::replace_images_with_placeholders(
+        messages,
+        "the summary request exceeded the provider's request-body limit (HTTP 413)",
+    );
+    if replaced == 0 {
+        anyhow::bail!("no inline images were left to replace");
+    }
+    let message = format!(
+        "Making room still exceeded the provider's request-body limit; replaced {replaced} inline image(s) with text notes for this summary pass and is retrying."
+    );
+    logging::warn(&message);
+    deliver_compaction_notice(notice_sink, message);
+    Ok(replaced)
+}
+
 fn is_context_window_error(e: &anyhow::Error) -> bool {
     let text = e.to_string();
     if crate::error_taxonomy::classify_error_message(&text)
@@ -1815,6 +2186,62 @@ mod tests {
     use codewhale_models::{ImageUrlContent, Message};
 
     #[test]
+    fn legacy_checkpoint_headings_are_recognised_but_quotes_are_not() {
+        for text in [
+            "## 📋 Conversation Summary (Auto-Generated)\n\nkey facts.",
+            "## Pinned Facts (User Anchors)\n\n- keep tabs\n\n---\n\n## 📋 Conversation Summary (Auto-Generated)\n\nfacts",
+            "Conversation Summary (Auto-Generated)\nold",
+            "Another language model started to solve this problem\nold",
+        ] {
+            assert!(is_legacy_compaction_summary_text(text), "{text}");
+        }
+        for text in [
+            "Explain: ## 📋 Conversation Summary (Auto-Generated)",
+            "## Pinned Facts (User Anchors)\nsee Conversation Summary (Auto-Generated) above",
+            "Codewhale handoff note\nnot structural",
+        ] {
+            assert!(!is_legacy_compaction_summary_text(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn restore_without_typed_checkpoint_preserves_user_marker_quotes() {
+        // The current marker is recognised only structurally (header block +
+        // provenance block), so only the legacy substring markers apply here.
+        for marker in [
+            LEGACY_V2_COMPACTION_SUMMARY_MARKER,
+            LEGACY_COMPACTION_SUMMARY_MARKER,
+        ] {
+            let quoted = Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("Explain this marker: {marker}"),
+                    cache_control: None,
+                }],
+            };
+            let legacy = Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("{marker}\nold summary"),
+                    cache_control: None,
+                }],
+            };
+            let messages = vec![quoted.clone(), legacy.clone()];
+            assert_eq!(
+                restore_compaction_checkpoint(messages.clone(), None),
+                messages
+            );
+
+            let summary = SystemPrompt::Text(build_compaction_summary_block_text("Summary", ""));
+            let restored =
+                restore_compaction_checkpoint(vec![quoted.clone(), legacy], Some(&summary));
+            assert_eq!(restored.len(), 2);
+            assert_eq!(restored[0], quoted);
+            assert!(is_wire_compaction_checkpoint_message(&restored[1]));
+        }
+    }
+
+    #[test]
     fn restore_replaces_duplicate_generated_checkpoints_without_deleting_user_quote() {
         let summary = SystemPrompt::Text(build_compaction_summary_block_text("Summary", ""));
         let generated = compaction_checkpoint_message(&summary);
@@ -1834,11 +2261,11 @@ mod tests {
         assert!(is_wire_compaction_checkpoint_message(&restored[0]));
         assert_eq!(restored[1], user_quote);
 
-        // No provenance means the historical broad cleanup remains in force.
+        // With a saved summary, legacy header-prefixed copies are replaced.
         let legacy = Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
-                text: format!("{COMPACTION_SUMMARY_MARKER}\nold summary"),
+                text: format!("{LEGACY_V2_COMPACTION_SUMMARY_MARKER}\nold summary"),
                 cache_control: None,
             }],
         };
@@ -1885,6 +2312,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
@@ -1898,6 +2326,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
                 is_error: None,
@@ -2150,6 +2579,348 @@ mod tests {
         2. Key technical concepts — sqlite. 7. Pending tasks — finish the fixed clock. \
         8. Current work — rerunning the session tests.";
 
+    /// A real PNG whose bytes are worth shrinking. Noise defeats compression,
+    /// which is the point: the shrink ladder must actually re-encode.
+    fn noisy_png_bytes(width: u32, height: u32) -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let mut pixels = image::RgbImage::new(width, height);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x.wrapping_mul(31) ^ y.wrapping_mul(17)) as u8,
+                (x.wrapping_mul(7) ^ y.wrapping_mul(29)) as u8,
+                (x.wrapping_add(y).wrapping_mul(13)) as u8,
+            ]);
+        }
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new_with_quality(
+            &mut bytes,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::NoFilter,
+        )
+        .write_image(
+            pixels.as_raw(),
+            width,
+            height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .expect("encode fixture png");
+        bytes
+    }
+
+    fn png_data_url(width: u32, height: u32) -> String {
+        use base64::Engine as _;
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(noisy_png_bytes(width, height))
+        )
+    }
+
+    fn user_image_message(data_url: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "look at this screenshot".to_string(),
+                    cache_control: None,
+                },
+                ContentBlock::ImageUrl {
+                    image_url: ImageUrlContent {
+                        url: data_url.to_string(),
+                    },
+                },
+            ],
+        }
+    }
+
+    /// Total inline-image URL bytes a request carries, the byte side an HTTP
+    /// 413 boundary actually measures.
+    fn inline_image_bytes(request: &MessageRequest) -> usize {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .map(|block| match block {
+                ContentBlock::ImageUrl { image_url } => image_url.url.len(),
+                ContentBlock::ToolResult { content_blocks, .. } => {
+                    content_blocks.as_ref().map_or(0, |blocks| {
+                        blocks.iter().fold(0, |sum, block| {
+                            let nested = block
+                                .get("data")
+                                .and_then(serde_json::Value::as_str)
+                                .map_or(0, str::len);
+                            sum + nested
+                        })
+                    })
+                }
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn summary_content() -> Vec<ContentBlock> {
+        vec![ContentBlock::Text {
+            text: "1. Primary request: keep working on the session store. \
+                   7. Pending: rerun the tests."
+                .to_string(),
+            cache_control: None,
+        }]
+    }
+
+    fn request_body_413() -> anyhow::Error {
+        anyhow::anyhow!(
+            "LLM error: HTTP 413: Failed to buffer the request body: length limit exceeded"
+        )
+    }
+
+    /// The same boundary stated by a fronting gateway (openresty) instead of
+    /// the API's own body reader. Reported on 2026-09-26; the ladder must
+    /// treat it as the same byte-side rejection.
+    fn request_body_413_html_gateway() -> anyhow::Error {
+        anyhow::anyhow!(
+            "LLM error: HTTP 413: DeepSeek API returned an HTML error page (HTTP 413): \
+             413 Request Entity Too Large 413 Request Entity Too Large openresty"
+        )
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingNoticeSink {
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingNoticeSink {
+        fn messages(&self) -> Vec<String> {
+            self.messages.lock().expect("notice sink").clone()
+        }
+    }
+
+    impl CompactionNoticeSink for RecordingNoticeSink {
+        fn notice(&self, message: String) {
+            self.messages.lock().expect("notice sink").push(message);
+        }
+    }
+
+    /// A 900x900 noise PNG exceeds the 2 MiB inline-image budget, so the
+    /// ladder must actually rewrite it.
+    fn body_413_retry_envelope(
+        sink: std::sync::Arc<RecordingNoticeSink>,
+    ) -> PreparedCompactionEnvelope {
+        let mut envelope = prepared(&CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        });
+        envelope.notice_sink = Some(sink);
+        envelope
+    }
+
+    #[tokio::test]
+    async fn request_body_413_reencodes_images_smaller_and_retries() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshots"),
+            user_image_message(&png_data_url(900, 900)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413()),
+            Ok(summary_content()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
+        assert!(
+            result.is_ok(),
+            "the retry after shrinking must succeed: {result:?}"
+        );
+
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 2, "one rejection, one retry");
+        let first = inline_image_bytes(&requests[0]);
+        let second = inline_image_bytes(&requests[1]);
+        assert!(first > 0, "the fixture must carry the image");
+        assert!(
+            second > 0 && second < first,
+            "the retry must carry smaller image bytes ({second} < {first})"
+        );
+        let notices = sink.messages();
+        assert_eq!(notices.len(), 1, "one notice per downgrade: {notices:?}");
+        assert!(
+            notices[0].contains("re-encoded") && notices[0].contains("413"),
+            "the notice must name the downgrade: {notices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_body_413_after_shrinking_replaces_images_with_notes() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshots"),
+            user_image_message(&png_data_url(900, 900)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413()),
+            Err(request_body_413()),
+            Ok(summary_content()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
+        assert!(
+            result.is_ok(),
+            "the retry after replacing images must succeed: {result:?}"
+        );
+
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 3, "reject, shrink retry, replace retry");
+        let first = inline_image_bytes(&requests[0]);
+        let second = inline_image_bytes(&requests[1]);
+        let third = inline_image_bytes(&requests[2]);
+        assert!(second > 0 && second < first);
+        assert_eq!(third, 0, "the last rung carries no image bytes");
+        let note_present = requests[2].messages.iter().any(|message| {
+            message.content.iter().any(|block| match block {
+                ContentBlock::Text { text, .. } => text.contains("omitted from this summary pass"),
+                _ => false,
+            })
+        });
+        assert!(note_present, "the summarizer is told what was there");
+        let notices = sink.messages();
+        assert_eq!(notices.len(), 2, "one notice per rung: {notices:?}");
+        assert!(notices[1].contains("replaced"), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn request_body_413_from_a_gateway_html_page_enters_the_same_ladder() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshots"),
+            user_image_message(&png_data_url(900, 900)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413_html_gateway()),
+            Ok(summary_content()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
+        assert!(
+            result.is_ok(),
+            "the gateway-page rejection must enter the ladder: {result:?}"
+        );
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 2, "one rejection, one retry");
+        assert!(
+            inline_image_bytes(&requests[1]) < inline_image_bytes(&requests[0]),
+            "the retry must carry smaller image bytes"
+        );
+        let notices = sink.messages();
+        assert_eq!(
+            notices.len(),
+            1,
+            "the user hears about the downgrade: {notices:?}"
+        );
+        assert!(notices[0].contains("413"), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn request_body_413_with_in_budget_images_skips_the_noop_retry_and_replaces() {
+        // The images fit their share of the 2 MiB budget, yet the endpoint
+        // refused the body: the cap sits below the budget. The ladder must not
+        // report "no images" (which would fail the pass outright) and must not
+        // resend identical bytes — it goes straight to the replace rung.
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshot"),
+            user_image_message(&png_data_url(64, 64)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413()),
+            Ok(summary_content()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
+        assert!(
+            result.is_ok(),
+            "in-budget images must still let the ladder finish: {result:?}"
+        );
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 2, "replace directly, no identical retry");
+        assert!(
+            inline_image_bytes(&requests[0]) > 0,
+            "the fixture carried the image"
+        );
+        assert_eq!(
+            inline_image_bytes(&requests[1]),
+            0,
+            "the retry carries notes, not bytes"
+        );
+        let notices = sink.messages();
+        assert_eq!(
+            notices.len(),
+            1,
+            "one notice for the replace rung: {notices:?}"
+        );
+        assert!(notices[0].contains("replaced"), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn request_body_413_without_inline_images_fails_with_context() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![msg("user", "no images anywhere in this history")];
+        let client = ScriptedSummaryClient::with_outcomes(vec![Err(request_body_413())]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let error = compact_messages_safe(&client, &messages, None, &envelope, &mut usage)
+            .await
+            .expect_err("nothing left to shrink, the pass must fail");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("request-body limit"),
+            "the failure must name the boundary: {text}"
+        );
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 1, "no pointless identical retry");
+        assert!(sink.messages().is_empty(), "nothing was downgraded");
+    }
+
+    #[tokio::test]
+    async fn request_body_413_after_replacements_fails_with_the_full_ladder() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshots"),
+            user_image_message(&png_data_url(900, 900)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413()),
+            Err(request_body_413()),
+            Err(request_body_413()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let error = compact_messages_safe(&client, &messages, None, &envelope, &mut usage)
+            .await
+            .expect_err("every rung refused, the pass must fail");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("even after re-encoding and then replacing"),
+            "the failure must report the full ladder: {text}"
+        );
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 3, "two retries, then stop");
+        assert_eq!(sink.messages().len(), 2, "both rungs announced");
+    }
+
     struct ScriptedSummaryClient {
         responses: std::sync::Mutex<std::collections::VecDeque<anyhow::Result<Vec<ContentBlock>>>>,
         requests: std::sync::Mutex<Vec<MessageRequest>>,
@@ -2386,7 +3157,7 @@ mod tests {
         };
         let text = &blocks[0].text;
         assert!(text.contains(FIXED_SUMMARY));
-        assert!(text.contains("Another language model"));
+        assert!(text.starts_with(COMPACTION_SUMMARY_MARKER));
 
         // Replacement history keeps older user turns, then the open round
         // verbatim (user + assistant + tools), then one checkpoint.
@@ -2645,6 +3416,7 @@ mod tests {
         // the retained copy must keep the text and drop the orphaned result.
         let mut mixed = msg("user", "Please keep this context.");
         mixed.content.push(ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "toolu_orphan_1".to_string(),
             content: "{\"ok\":true}".to_string(),
             is_error: None,
@@ -2748,7 +3520,7 @@ mod tests {
         else {
             panic!("retry instruction must be text");
         };
-        assert!(text.contains("previous handoff response was empty"));
+        assert!(text.contains("previous reply was empty or a placeholder"));
         drop(requests);
 
         assert_eq!(
@@ -3085,6 +3857,7 @@ mod tests {
                         thinking: thinking.clone(),
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "tool-1".to_string(),
                         name: "read_file".to_string(),
                         input: serde_json::json!({"path": "Cargo.toml"}),
@@ -3096,6 +3869,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "tool-1".to_string(),
                     content: "manifest".to_string(),
                     is_error: None,
