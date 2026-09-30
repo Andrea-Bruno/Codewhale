@@ -1179,19 +1179,26 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     // the runtime no longer has that thread (its data dir was wiped or
     // moved), every turn would fail against it forever; start a new runtime
     // thread and relink instead. Only a definite 404 counts as gone.
-    if let Some(restored) = durable.as_ref().and_then(|d| d.restored.as_deref())
-        && thread_map.get(turn.thread_key).map(String::as_str) == Some(restored)
-        && !bridge
+    if !thread_map.contains_key(turn.thread_key)
+        && let Some(restored) = durable
+            .as_ref()
+            .and_then(|d| d.runtime_thread_id.as_deref())
+    {
+        // Do not install a restored mapping before validation. If this
+        // request fails or is cancelled, the next caller must check again.
+        if bridge
             .runtime_thread_exists(restored)
             .await
             .map_err(|err| JsonRpcError::runtime_unavailable(err.to_string()))?
-    {
-        tracing::warn!(
-            thread = turn.thread_key,
-            runtime_thread = restored,
-            "linked runtime thread no longer exists; starting a new runtime thread"
-        );
-        bridge.forget_thread(&mut thread_map, turn.thread_key);
+        {
+            thread_map.insert(turn.thread_key.to_string(), restored.to_string());
+        } else {
+            tracing::warn!(
+                thread = turn.thread_key,
+                runtime_thread = restored,
+                "linked runtime thread no longer exists; starting a new runtime thread"
+            );
+        }
     }
     if turn.max_output_tokens.is_some() {
         let info = bridge
@@ -1233,7 +1240,7 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     // mapping change and its persistence, and no runtime lock is taken while
     // the bridge and thread-map locks are held.
     if let Some(durable) = durable.as_ref()
-        && (minted || !durable.linked)
+        && (minted || durable.runtime_thread_id.is_none())
         && let Err(err) = durable
             .store
             .set_runtime_thread_link(turn.thread_key, &runtime_thread_id)
@@ -1283,17 +1290,13 @@ struct DurableThread {
     store: StateStore,
     /// The workspace the thread recorded (`thread/create`, `thread/resume`).
     cwd: PathBuf,
-    /// Whether the store already held a runtime link for the thread.
-    linked: bool,
-    /// The runtime thread this call restored from the store into the
-    /// in-memory map. It was minted by an earlier process, so the turn checks
-    /// that the runtime still has it before use.
-    restored: Option<String>,
+    /// Saved link, checked against the runtime before installing it in the
+    /// in-memory map. A failed or cancelled check must remain retryable.
+    runtime_thread_id: Option<String>,
 }
 
-/// Restore `thread_key`'s durable runtime link into the in-memory map and
-/// return the persisted thread, if there is one, so a runtime thread minted
-/// for it can be linked.
+/// Read `thread_key`'s durable runtime link and persisted thread, if any,
+/// before taking the bridge lock. Installation follows runtime validation.
 ///
 /// The in-memory map dies with the process; without the durable link, a
 /// thread created before a daemon restart silently continued on a brand-new,
@@ -1324,22 +1327,13 @@ async fn restore_thread_link(
         }
         return Ok(None);
     };
-    let link = store
+    let runtime_thread_id = store
         .get_runtime_thread_link(thread_key)
         .map_err(internal)?;
-    let mut restored = None;
-    if let Some(runtime_thread_id) = link.as_ref() {
-        let mut thread_map = state.runtime_thread_map.lock().await;
-        if !thread_map.contains_key(thread_key) {
-            thread_map.insert(thread_key.to_string(), runtime_thread_id.clone());
-            restored = Some(runtime_thread_id.clone());
-        }
-    }
     Ok(Some(DurableThread {
         store,
         cwd: metadata.cwd,
-        linked: link.is_some(),
-        restored,
+        runtime_thread_id,
     }))
 }
 
@@ -3332,6 +3326,7 @@ mod tests {
         turn_threads: Arc<Mutex<Vec<String>>>,
         /// The `workspace` each minted thread was asked to start in.
         workspaces: Arc<Mutex<Vec<Value>>>,
+        lookup_failures: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     async fn spawn_recording_runtime() -> (String, RecordingRuntime, tokio::task::JoinHandle<()>) {
@@ -3344,7 +3339,20 @@ mod tests {
             Json(json!({ "id": "thr_minted" }))
         }
         // Only the thread this runtime mints exists; any other id is gone.
-        async fn get_thread(AxumPath(thread_id): AxumPath<String>) -> StatusCode {
+        async fn get_thread(
+            State(f): State<RecordingRuntime>,
+            AxumPath(thread_id): AxumPath<String>,
+        ) -> StatusCode {
+            if f.lookup_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return StatusCode::SERVICE_UNAVAILABLE;
+            }
             if thread_id == "thr_minted" {
                 StatusCode::OK
             } else {
@@ -3378,6 +3386,7 @@ mod tests {
             created: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             turn_threads: Arc::new(Mutex::new(Vec::new())),
             workspaces: Arc::new(Mutex::new(Vec::new())),
+            lookup_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3652,6 +3661,66 @@ mod tests {
             "the stale link is replaced",
         );
 
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn restored_thread_link_retries_validation_after_a_transient_failure() {
+        crate::install_test_crypto_provider();
+        let (base_url, fixture, server) = spawn_recording_runtime().await;
+        let (state, _tmp) = capability_test_state();
+        seed_client_thread(&state, "client-1").await;
+        let store = state
+            .runtime
+            .read()
+            .await
+            .thread_manager
+            .state_store()
+            .clone();
+        store
+            .set_runtime_thread_link("client-1", "thr_gone")
+            .unwrap();
+        seed_bridge_at(&state, base_url).await;
+        fixture
+            .lookup_failures
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let failed = dispatch_stdio_request(
+            &state,
+            "thread/message",
+            json!({ "thread_id": "client-1", "input": "first" }),
+        )
+        .await
+        .expect_err("an uncertain lookup must not mint or send a turn");
+        assert_eq!(failed.code, RUNTIME_UNAVAILABLE_CODE);
+        assert_eq!(fixture.created.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(fixture.turn_threads.lock().await.is_empty());
+        assert!(state.runtime_thread_map.lock().await.is_empty());
+        assert_eq!(
+            store
+                .get_runtime_thread_link("client-1")
+                .unwrap()
+                .as_deref(),
+            Some("thr_gone")
+        );
+
+        dispatch_stdio_request(
+            &state,
+            "thread/message",
+            json!({ "thread_id": "client-1", "input": "retry" }),
+        )
+        .await
+        .expect("the next caller rechecks and repairs the confirmed missing thread");
+        assert_eq!(fixture.created.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fixture.turn_threads.lock().await.as_slice(), ["thr_minted"]);
+        assert_eq!(
+            store
+                .get_runtime_thread_link("client-1")
+                .unwrap()
+                .as_deref(),
+            Some("thr_minted")
+        );
         server.abort();
         let _ = server.await;
     }
