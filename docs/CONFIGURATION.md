@@ -751,9 +751,9 @@ read from `TYPESAFE_API_KEY`, the `typesafe` secret-store entry, or
 
 #### Decision routers (`kind = "decision"`)
 
-A decision router asks a non-generative decision model one typed question per
-turn — a Choice between the active provider's `fast` and `strong` tiers, plus a
-thinking level — and gets calibrated probabilities back. No prose is parsed.
+A decision router asks a non-generative decision model typed Choice questions
+for the active provider's `fast` and `strong` tiers and thinking level, then
+reads calibrated probabilities. No prose is parsed.
 
 ```toml
 [auto.router]
@@ -771,7 +771,7 @@ min_confidence = 0.5          # default 0.5, clamped to 0..1
   0.75, or the turn stays on the fast tier.
 - An unknown `kind`, or a decision `provider` other than `openrouter` /
   `typesafe`, leaves the router unconfigured and shown as failing.
-- `thinking` is ignored for decision routers. Both routes settle tokens through
+- `[auto.router] thinking` is ignored for decision routers. Both routes settle tokens through
   the originating session's routed-usage ledger. TypeSafe is a named Custom route
   with unknown billing; its price is never borrowed from the active chat provider.
   Provider-reported cost remains verbatim on the decision receipt.
@@ -809,6 +809,13 @@ SUPERFAST_TIMEOUT_MS=150         # 1..=10000, default 150
   Its tokens settle through the shared ledger; missing usage or a cancelled/timed
   out request after dispatch creates an explicit coverage gap. Unknown TypeSafe
   pricing is recorded as unpriced rather than free.
+- Provider-reported cost survives rejected answers and late responses in bounded
+  receipts on the originating turn or session. These are diagnostic evidence;
+  unknown pricing never becomes an authoritative dollar total. Incomplete token
+  counters record a coverage gap while preserving the reported raw evidence.
+
+The wire contracts are documented in [TypeSafe's OpenAPI schema](https://api.typesafe.ai/openapi.json)
+and [OpenRouter's Decisions examples](https://openrouter.ai/blog/insights/what-is-jev/).
 
 The Decision Gate concept and reference implementation are by Andrea Bruno,
 released under CC BY 4.0:
@@ -3487,9 +3494,3 @@ codewhale sessions scrub-secrets --apply  # rewrite the affected files
 so it never loses a concurrent save. A session that is still open can write
 its in-memory copy back on its next save, so close open sessions first, and
 rotate any credential that was exposed — masking a stored copy cannot un-leak it.
-
-Decision API compatibility uses OpenRouter `/api/alpha/decisions` and TypeSafe
-`/v1/systemone` on the existing authenticated client. Provider-reported cost is
-preserved verbatim in bounded decision receipts on the original turn or session,
-including rejected answers and late shadow responses. Receipts are diagnostic;
-they do not turn unknown pricing into an authoritative dollar total.
