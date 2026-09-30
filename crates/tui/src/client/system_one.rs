@@ -123,24 +123,64 @@ pub(crate) fn typesafe_api_key(config: &Config) -> Option<String> {
 }
 
 /// A decoded System One response. Unknown fields are ignored.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct SystemOneResponse {
-    #[serde(default)]
     pub(crate) id: Option<String>,
-    #[serde(default)]
     pub(crate) model: Option<String>,
-    #[serde(default)]
     pub(crate) answers: BTreeMap<String, SystemOneAnswer>,
-    #[serde(default)]
     pub(crate) usage: Option<SystemOneUsage>,
     /// Transport validation is separate from decoding so a rejected policy
     /// answer still preserves the provider's usage/cost evidence.
-    #[serde(skip)]
     pub(crate) answers_validated: Option<bool>,
 }
 
+impl<'de> Deserialize<'de> for SystemOneResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            #[serde(default)]
+            id: Option<Box<RawValue>>,
+            #[serde(default)]
+            model: Option<Box<RawValue>>,
+            #[serde(default)]
+            answers: Option<Box<RawValue>>,
+            #[serde(default)]
+            usage: Option<Box<RawValue>>,
+        }
+        let wire = Envelope::deserialize(deserializer)?;
+        let text = |raw: Option<&RawValue>| {
+            raw.and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
+        };
+        let id = text(wire.id.as_deref());
+        let model = text(wire.model.as_deref());
+        let malformed_identity =
+            (wire.id.is_some() && id.is_none()) || (wire.model.is_some() && model.is_none());
+        // Invalid policy fields must fail validation without discarding the
+        // separately reported billing evidence. Empty/default answers never
+        // satisfy the required question types or probabilities.
+        let answers: BTreeMap<String, Box<RawValue>> = wire
+            .answers
+            .and_then(|raw| serde_json::from_str(raw.get()).ok())
+            .unwrap_or_default();
+        Ok(Self {
+            id,
+            model,
+            answers: answers
+                .into_iter()
+                .map(|(key, raw)| (key, serde_json::from_str(raw.get()).unwrap_or_default()))
+                .collect(),
+            usage: wire
+                .usage
+                .and_then(|raw| serde_json::from_str(raw.get()).ok()),
+            answers_validated: malformed_identity.then_some(false),
+        })
+    }
+}
+
 /// One answer. The `choice` and `noul` subsets are interpreted.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct SystemOneAnswer {
     #[serde(rename = "type", default)]
     pub(crate) kind: String,
@@ -174,21 +214,20 @@ impl<'de> Deserialize<'de> for SystemOneUsage {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct WireUsage {
-            #[serde(default)]
-            cost: Option<Box<RawValue>>,
-            #[serde(default, alias = "inputTokens")]
-            input_tokens: Option<u32>,
-            #[serde(default, alias = "outputTokens")]
-            output_tokens: Option<u32>,
-        }
-        let wire = WireUsage::deserialize(deserializer)?;
+        let mut wire = BTreeMap::<String, Box<RawValue>>::deserialize(deserializer)?;
+        let count = |snake: &str, camel: &str| match (wire.get(snake), wire.get(camel)) {
+            (Some(raw), None) | (None, Some(raw)) => serde_json::from_str::<u32>(raw.get()).ok(),
+            // Missing, malformed or ambiguous counts cannot authorize policy
+            // or a priced subtotal; keep an independently valid raw cost.
+            _ => None,
+        };
+        let input_tokens = count("input_tokens", "inputTokens");
+        let output_tokens = count("output_tokens", "outputTokens");
         Ok(Self {
-            complete: wire.input_tokens.is_some() && wire.output_tokens.is_some(),
-            input_tokens: wire.input_tokens.unwrap_or(0),
-            output_tokens: wire.output_tokens.unwrap_or(0),
-            cost: wire.cost,
+            complete: input_tokens.is_some() && output_tokens.is_some(),
+            input_tokens: input_tokens.unwrap_or(0),
+            output_tokens: output_tokens.unwrap_or(0),
+            cost: wire.remove("cost"),
         })
     }
 }
@@ -373,10 +412,11 @@ fn valid_decision_response(body: &Value, response: &SystemOneResponse) -> bool {
     let Some(questions) = body.get("questions").and_then(Value::as_object) else {
         return false;
     };
-    response
-        .model
-        .as_deref()
-        .is_some_and(|m| !m.trim().is_empty() && m.len() <= 256)
+    response.answers_validated != Some(false)
+        && response
+            .model
+            .as_deref()
+            .is_some_and(|m| !m.trim().is_empty() && m.len() <= 256)
         && response.usage.as_ref().is_some_and(|usage| usage.complete)
         && response.answers.len() == questions.len()
         && questions.iter().all(|(name, question)| {
@@ -660,5 +700,62 @@ mod decisions_compatibility_tests {
         let mut invalid = request();
         invalid["questions"]["urgency"]["criteria"] = json!([null]);
         assert!(!valid_decision_request(&invalid));
+    }
+
+    #[test]
+    fn malformed_policy_fields_retain_independent_raw_cost() {
+        for (pointer, value) in [
+            ("/answers/intent/choice", json!(17)),
+            ("/answers/intent/confidence", json!("high")),
+            ("/answers/refund", Value::Null),
+            ("/answers", json!([])),
+            ("/model", json!({"invalid":"model"})),
+            ("/id", json!([])),
+        ] {
+            let mut body = response();
+            *body.pointer_mut(pointer).expect("fixture field") = value;
+            let decoded: SystemOneResponse =
+                serde_json::from_value(body).expect("billing envelope");
+            assert!(
+                !valid_decision_response(&request(), &decoded),
+                "accepted {pointer}"
+            );
+            let usage = decoded
+                .usage
+                .expect("independent usage survives rejected policy");
+            assert!(usage.complete);
+            assert_eq!(usage.input_tokens, 287);
+            assert_eq!(usage.output_tokens, 20);
+            assert_eq!(usage.reported_cost().as_deref(), Some("0.000012054"));
+        }
+    }
+
+    #[test]
+    fn malformed_or_overflowed_counters_retain_cost_without_priced_usage() {
+        for counters in [
+            json!({"input_tokens": u64::MAX, "output_tokens":20}),
+            json!({"input_tokens": -1, "output_tokens":20}),
+            json!({"input_tokens": "287", "output_tokens":20}),
+            json!({"input_tokens": 287, "inputTokens":287, "output_tokens":20}),
+            json!({"input_tokens": 287, "output_tokens":1.5}),
+        ] {
+            let mut body = response();
+            body["usage"] = counters;
+            body["usage"]["cost"] = json!(0.000012054);
+            let decoded: SystemOneResponse =
+                serde_json::from_value(body).expect("billing envelope");
+            assert!(!valid_decision_response(&request(), &decoded));
+            let usage = decoded.usage.as_ref().expect("independent cost");
+            assert!(!usage.complete);
+            assert_eq!(usage.reported_cost().as_deref(), Some("0.000012054"));
+            let route = crate::cost_status::decision_receipt_fixture("malformed-count").route;
+            let batch = crate::model_routing::decision_usage_batch(&route, &decoded);
+            assert!(
+                batch.records.is_empty(),
+                "invalid counters cannot fabricate priced usage"
+            );
+            assert_eq!(batch.dropped_records, 1);
+            assert_eq!(batch.drop_records.len(), 1);
+        }
     }
 }

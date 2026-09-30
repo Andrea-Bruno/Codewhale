@@ -3765,6 +3765,58 @@ mod decision_router_tests {
         assert_eq!(recommendation.reasoning_effort, None);
     }
 
+    #[tokio::test]
+    async fn malformed_decision_envelopes_preserve_cost_without_a_route_hop() {
+        let _env = hermetic_env();
+        for (pointer, value, incomplete_usage) in [
+            ("/answers/tier/choice", serde_json::json!(17), false),
+            ("/model", serde_json::json!({"invalid":"model"}), false),
+            ("/usage/input_tokens", serde_json::json!(u64::MAX), true),
+        ] {
+            let server = MockServer::start().await;
+            let mut body = answer_body(0.9, 0.9);
+            *body.pointer_mut(pointer).expect("fixture field") = value;
+            Mock::given(method("POST"))
+                .and(path("/api/alpha/decisions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let config = decision_config(&format!("{}/api/v1", server.uri()), false, 2);
+            let fallback =
+                auto_route_without_router(&config, &ModelInventory::from_config(&config));
+            let selection = route(&config, "Explain a variable name", "").await;
+            assert_eq!(selection.source, AutoRouteSource::Heuristic);
+            assert_eq!(selection.provider, fallback.provider);
+            assert_eq!(
+                selection.model, fallback.model,
+                "malformed policy cannot change the route"
+            );
+            let receipt = receipt(&selection);
+            assert_eq!(
+                receipt.router_failure,
+                Some(AutoRouterFailure::InvalidAnswer)
+            );
+            assert_eq!(
+                receipt
+                    .decision
+                    .as_ref()
+                    .expect("billing evidence")
+                    .provider_reported_cost_usd
+                    .as_deref(),
+                Some("0.000019992")
+            );
+            if incomplete_usage {
+                assert!(selection.routed_usage.is_empty());
+                assert_eq!(selection.routed_usage_dropped_records, 1);
+                assert_eq!(selection.routed_usage_drop_records.len(), 1);
+            } else {
+                assert_eq!(selection.routed_usage.len(), 1);
+                assert!(selection.routed_usage_drop_records.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn camel_case_usage_and_verbatim_cost_parse() {
         let response = parsed(serde_json::json!({
