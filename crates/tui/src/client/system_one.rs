@@ -21,7 +21,8 @@
 //! * The routing call makes one attempt (no retry): it is bounded by the
 //!   router timeout, and a retried decision would arrive after the turn has
 //!   already fallen back.
-//! * Only the `choice` answer shape is parsed; `score` / `noul` are later.
+//! * The router parses the `choice` answer shape; the shadow Decision Gate
+//!   (`crate::superfast`) also reads `noul`. `score` is not parsed.
 
 use std::collections::BTreeMap;
 
@@ -129,13 +130,16 @@ pub(crate) struct SystemOneResponse {
     pub(crate) usage: Option<SystemOneUsage>,
 }
 
-/// One answer. Only the `choice` subset is interpreted.
+/// One answer. The `choice` and `noul` subsets are interpreted.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct SystemOneAnswer {
     #[serde(rename = "type", default)]
     pub(crate) kind: String,
     #[serde(default)]
     pub(crate) choice: Option<String>,
+    /// A `noul` answer's probability; validated by its reader.
+    #[serde(default)]
+    pub(crate) noul: Option<f64>,
     #[serde(default)]
     pub(crate) probabilities: BTreeMap<String, Option<f64>>,
     #[serde(default)]

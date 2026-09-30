@@ -1,35 +1,62 @@
 //! Superfast Decision Gate — a small, off-by-default "System One" front-door
-//! classifier for the agent turn loop.
+//! classifier for the agent turn loop (#6603).
 //!
 //! Every user message normally wakes a large, slow, expensive model just to
 //! decide intent and whether a tool is needed. The Decision Gate asks a small,
-//! fast decision model (Von, or any Jev-compatible server) those routine
+//! fast decision model (a Jev-compatible System One endpoint) those routine
 //! questions in one non-generating pass, and derives a conservative routing
 //! recommendation. A later, validated step could send each turn to the cheapest
 //! correct path; this first increment only measures and logs.
 //!
-//! Design contract (identical to the reference implementation):
-//!   - Off by default. Nothing runs unless `SUPERFAST_ENABLED` is set to a
-//!     truthy value. A user who does nothing sees the exact current behavior.
-//!   - Shadow mode. The gate classifies the turn and logs its recommendation
-//!     through `tracing`, but never changes routing, never skips the model
-//!     call, and never alters any user-visible behavior.
+//! Design contract:
+//!   - Off by default. Nothing runs unless `SUPERFAST_ENABLED` is truthy, and
+//!     an enabled gate also needs `SUPERFAST_PROVIDER` naming the route it may
+//!     call, so turning the gate on never picks a paid endpoint by itself.
+//!   - Shadow mode. The gate classifies the turn and logs a typed
+//!     [`ShadowOutcome`] through `tracing` (target `superfast`), but never
+//!     changes routing, never skips or delays the model call, and never alters
+//!     any user-visible behavior.
 //!   - Fail open. Any error, timeout, non-2xx response, unreachable backend,
-//!     or malformed body yields "no opinion" and the agent continues exactly
-//!     as if the gate were off. It never throws into the loop and never adds
-//!     latency to the real turn (the request runs on a detached task with a
-//!     short timeout).
-//!   - No heavy new dependencies. It talks to the decision backend with a
-//!     plain HTTP POST using `reqwest`, which the crate already depends on.
-//!     The decision model itself is installed out of band, not bundled.
+//!     or malformed body is a typed failure class and the turn continues
+//!     exactly as if the gate were off. The call runs on a detached task.
+//!   - One transport. The call goes through the existing System One client
+//!     (`client::system_one`: `CodewhaleClient::for_decision_route` and
+//!     `system_one_decide`) that serves the `[auto.router] kind = "decision"`
+//!     router — same auth, TLS, secret redaction and one-attempt policy. There
+//!     is no second HTTP client.
+//!
+//! Configuration (environment, read when a turn starts):
+//!   - `SUPERFAST_ENABLED` — `1` / `true` / `yes` / `on` turns the gate on.
+//!   - `SUPERFAST_PROVIDER` — `typesafe` or `openrouter` (required when on).
+//!     The key comes from the same place the decision router reads it.
+//!   - `SUPERFAST_BASE_URL` — optional TypeSafe-route base override, e.g. a
+//!     self-hosted Jev server at `http://localhost:8000/v1`; `/systemone` is
+//!     appended.
+//!   - `SUPERFAST_MODEL` — decision model id (default `jev-latest` for
+//!     TypeSafe, `~typesafe/jev-latest` for OpenRouter).
+//!   - `SUPERFAST_TIMEOUT_MS` — per-call deadline, 1..=10000 (default 150).
+//!
+//! Known limits (written down so nobody assumes them):
+//!   - Shadow only: the recommendation is logged, never acted on.
+//!   - Only the latest user message's text is sent, truncated to 4,000
+//!     characters and redacted of configured secrets. No prompt text is
+//!     logged; the log carries the route, failure class and latency.
+//!   - The TypeSafe route needs a TypeSafe key even for a self-hosted server
+//!     (the transport always authenticates); a server that ignores auth can
+//!     be given any placeholder key.
+//!   - The gate's own spend is the configured endpoint's and is not entered
+//!     in session cost totals or Auto receipts.
+//!   - Misconfiguration while enabled (missing or unknown provider, bad
+//!     timeout, missing key) is logged at `warn` for each turn and nothing is
+//!     sent.
 //!
 //! The Decision Gate concept and the reference implementation are by Andrea
-//! Bruno, released under Creative Commons Attribution 4.0 (CC BY 4.0). See
-//! the harness-superfast white paper for the full design. The decision models
+//! Bruno, released under Creative Commons Attribution 4.0 (CC BY 4.0); see
+//! <https://github.com/Andrea-Bruno/harness-superfast>. The decision models
 //! (Von, OpenJev, Laya) are third-party open models; only the integration
 //! architecture and the routing method here are covered by that attribution.
 
-use std::env;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -37,24 +64,32 @@ use serde_json::{Value, json};
 use codewhale_core::request::{ContentBlock, Message};
 use codewhale_core::role::Role;
 
+use crate::client::CodewhaleClient;
+use crate::client::system_one::{DecisionRouterRoute, SystemOneResponse};
+use crate::config::Config;
+use crate::model_routing::{AutoRouterFailure, truncate_for_auto_router};
+
 /// Master switch. The gate never runs unless this env var is truthy.
 const ENABLED_VAR: &str = "SUPERFAST_ENABLED";
-/// Full URL of the decision endpoint.
-const ENDPOINT_VAR: &str = "SUPERFAST_ENDPOINT";
-/// Model id sent in the request body.
+/// Which System One route the gate may call: `typesafe` or `openrouter`.
+const PROVIDER_VAR: &str = "SUPERFAST_PROVIDER";
+/// Optional TypeSafe-route base URL (`/systemone` is appended).
+const BASE_URL_VAR: &str = "SUPERFAST_BASE_URL";
+/// Decision model id sent in the request body.
 const MODEL_VAR: &str = "SUPERFAST_MODEL";
-/// Hard timeout for a single decision call, in milliseconds.
+/// Per-call deadline in milliseconds.
 const TIMEOUT_VAR: &str = "SUPERFAST_TIMEOUT_MS";
 
-const DEFAULT_ENDPOINT: &str = "http://localhost:8000/v1/systemone";
-const DEFAULT_MODEL: &str = "von-1.2.0";
 const DEFAULT_TIMEOUT_MS: u64 = 150;
+const MAX_TIMEOUT_MS: u64 = 10_000;
+/// Characters of the latest user message sent as decision state.
+const MAX_STATE_CHARS: usize = 4_000;
 
 /// Conservative routing recommendation derived from a turn's answers. Only a
 /// decisive set of numbers produces a fast route; anything else is `Unknown`,
 /// which means "fall back to the full model exactly as today".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Route {
+pub(crate) enum Route {
     NeedsTool,
     AnswerFromContext,
     PlainChat,
@@ -72,14 +107,87 @@ impl Route {
     }
 }
 
-/// True when `SUPERFAST_ENABLED` is set to a truthy value.
-fn enabled() -> bool {
-    env::var(ENABLED_VAR).ok().is_some_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+/// Everything one shadow evaluation can end in. Bounded by construction: a
+/// route or a non-secret failure class, plus the measured latency. Provider
+/// bodies and prompt text never enter this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShadowOutcome {
+    /// The decision model answered; `route` is the derived recommendation.
+    Recommendation { route: Route, latency_ms: u64 },
+    /// Fail open: nothing reached the model request. `NotRunnable` means the
+    /// route could not be built (no key, bad URL) and nothing was sent.
+    Failed {
+        failure: AutoRouterFailure,
+        latency_ms: u64,
+    },
+}
+
+/// The route an enabled gate calls, resolved from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShadowSettings {
+    route: DecisionRouterRoute,
+    base_url: Option<String>,
+    model: String,
+    timeout: Duration,
+}
+
+impl ShadowSettings {
+    /// `None` when the gate is off; `Some(Err)` when it is on but
+    /// misconfigured (the message names the variable to fix).
+    fn from_env() -> Option<Result<Self, String>> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<Result<Self, String>> {
+        let value = |name: &str| {
+            lookup(name)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let enabled = value(ENABLED_VAR).is_some_and(|flag| {
+            matches!(
+                flag.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+        enabled.then(|| Self::parse(&value))
+    }
+
+    fn parse(value: &impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let provider = value(PROVIDER_VAR).ok_or_else(|| {
+            format!(
+                "{ENABLED_VAR} is set but {PROVIDER_VAR} is not; set it to typesafe or openrouter"
+            )
+        })?;
+        let route = DecisionRouterRoute::parse(&provider).ok_or_else(|| {
+            format!(
+                "{PROVIDER_VAR}={provider:?} is not a decision route; use typesafe or openrouter"
+            )
+        })?;
+        let timeout_ms = match value(TIMEOUT_VAR) {
+            None => DEFAULT_TIMEOUT_MS,
+            Some(raw) => raw
+                .parse::<u64>()
+                .ok()
+                .filter(|ms| (1..=MAX_TIMEOUT_MS).contains(ms))
+                .ok_or_else(|| {
+                    format!("{TIMEOUT_VAR}={raw:?} must be 1..={MAX_TIMEOUT_MS} milliseconds")
+                })?,
+        };
+        let model = value(MODEL_VAR).unwrap_or_else(|| {
+            match route {
+                DecisionRouterRoute::Typesafe => "jev-latest",
+                DecisionRouterRoute::Openrouter => "~typesafe/jev-latest",
+            }
+            .to_string()
+        });
+        Ok(Self {
+            route,
+            base_url: value(BASE_URL_VAR),
+            model,
+            timeout: Duration::from_millis(timeout_ms),
+        })
+    }
 }
 
 /// Text of the last user message, or `None` when there is none or it is blank.
@@ -98,56 +206,120 @@ fn last_user_text(messages: &[Message]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Fire the shadow gate for a turn. Returns immediately: the classification
-/// runs on a detached task and only logs. This is a no-op when the gate is
-/// disabled, when there is no user text, or when no tokio runtime is present.
-/// It never blocks or alters the real model request.
-pub fn spawn_shadow_gate(messages: &[Message]) {
-    if !enabled() {
-        return;
-    }
-    let Some(state) = last_user_text(messages) else {
-        return;
-    };
-    // A detached task needs a runtime handle; if there is none (for example a
-    // bare unit test), skip rather than panic.
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let endpoint = env::var(ENDPOINT_VAR).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
-    let model = env::var(MODEL_VAR).unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-    let timeout_ms = env::var(TIMEOUT_VAR)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|t| *t > 0)
-        .unwrap_or(DEFAULT_TIMEOUT_MS);
-
-    handle.spawn(async move {
-        let started = Instant::now();
-        let route = classify(&state, &endpoint, &model, timeout_ms).await;
-        let latency_ms = started.elapsed().as_millis();
-        match route {
-            Some(route) => tracing::info!(
-                target: "superfast",
-                route = route.as_str(),
-                latency_ms,
-                "decision gate (shadow) recommendation"
-            ),
-            None => tracing::debug!(
-                target: "superfast",
-                latency_ms,
-                "decision gate (shadow) no opinion (fail-open)"
-            ),
+/// Fire the shadow gate for a turn's first model request. Returns at once:
+/// the evaluation runs on a detached task and only logs. No task is started
+/// (and `None` is returned) when the gate is off or misconfigured, when there
+/// is no user text, or when no Tokio runtime is present. The handle exists
+/// for tests; the turn loop drops it.
+pub(crate) fn spawn_shadow_gate(
+    config: &Config,
+    messages: &[Message],
+) -> Option<tokio::task::JoinHandle<ShadowOutcome>> {
+    let settings = match ShadowSettings::from_env()? {
+        Ok(settings) => settings,
+        Err(message) => {
+            tracing::warn!(target: "superfast", "decision gate (shadow) not run: {message}");
+            return None;
         }
-    });
+    };
+    let latest_request = last_user_text(messages)?;
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let config = config.clone();
+    Some(runtime.spawn(async move {
+        let outcome = evaluate(&config, &settings, &latest_request).await;
+        log_outcome(outcome);
+        outcome
+    }))
 }
 
-/// Ask the decision backend and derive a conservative route. Returns `None`
-/// on any error, timeout, non-2xx response, or malformed body (fail open).
-async fn classify(state: &str, endpoint: &str, model: &str, timeout_ms: u64) -> Option<Route> {
-    let body = json!({
+fn log_outcome(outcome: ShadowOutcome) {
+    match outcome {
+        ShadowOutcome::Recommendation { route, latency_ms } => tracing::info!(
+            target: "superfast",
+            route = route.as_str(),
+            latency_ms,
+            "decision gate (shadow) recommendation"
+        ),
+        ShadowOutcome::Failed {
+            failure: AutoRouterFailure::NotRunnable,
+            ..
+        } => tracing::warn!(
+            target: "superfast",
+            "decision gate (shadow) not run: route not runnable (check the {PROVIDER_VAR} key and {BASE_URL_VAR})"
+        ),
+        ShadowOutcome::Failed {
+            failure,
+            latency_ms,
+        } => tracing::debug!(
+            target: "superfast",
+            failure = %failure.label(),
+            latency_ms,
+            "decision gate (shadow) no opinion (fail-open)"
+        ),
+    }
+}
+
+/// One shadow evaluation over the existing System One transport.
+async fn evaluate(
+    config: &Config,
+    settings: &ShadowSettings,
+    latest_request: &str,
+) -> ShadowOutcome {
+    // Client construction resolves keys (environment, secret store), so it
+    // runs off the async worker (#6149).
+    let built = {
+        let config = config.clone();
+        let route = settings.route;
+        let base_url = settings.base_url.clone();
+        #[cfg(test)]
+        let ticket = crate::test_support::env_scope_ticket();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(ticket);
+            CodewhaleClient::for_decision_route(&config, route, base_url.as_deref())
+        })
+        .await
+    };
+    let Ok(Ok(client)) = built else {
+        return ShadowOutcome::Failed {
+            failure: AutoRouterFailure::NotRunnable,
+            latency_ms: 0,
+        };
+    };
+    let body = decision_body(&client, &settings.model, latest_request);
+    let dispatched = AtomicBool::new(false);
+    let started = Instant::now();
+    let answer = tokio::time::timeout(
+        settings.timeout,
+        client.system_one_decide(&body, &dispatched),
+    )
+    .await;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match answer {
+        Err(_) => ShadowOutcome::Failed {
+            failure: AutoRouterFailure::Timeout,
+            latency_ms,
+        },
+        Ok(Err(failure)) => ShadowOutcome::Failed {
+            failure,
+            latency_ms,
+        },
+        Ok(Ok(response)) => ShadowOutcome::Recommendation {
+            route: derive_route(&response),
+            latency_ms,
+        },
+    }
+}
+
+/// The System One request: two `noul` questions and one `choice` over the
+/// redacted, bounded latest request.
+fn decision_body(client: &CodewhaleClient, model: &str, latest_request: &str) -> Value {
+    json!({
         "model": model,
-        "state": state,
+        "state": {
+            "latest_request": client
+                .redact_model_bound_text(&truncate_for_auto_router(latest_request, MAX_STATE_CHARS)),
+        },
         "questions": {
             "needs_tool": {
                 "type": "noul",
@@ -169,42 +341,31 @@ async fn classify(state: &str, endpoint: &str, model: &str, timeout_ms: u64) -> 
                 }
             }
         }
-    });
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()
-        .ok()?;
-    let res = client.post(endpoint).json(&body).send().await.ok()?;
-    if !res.status().is_success() {
-        return None;
-    }
-    let parsed: Value = res.json().await.ok()?;
-    let answers = parsed.get("answers")?.as_object()?;
-    Some(derive_route(answers))
+    })
 }
 
-/// Read a noul probability only when it is a real, finite value in [0, 1].
-/// Anything else (absent, NaN, Infinity, out of range, wrong type) is treated
-/// as "no evidence", so a mis-scaled or missing answer can never produce a
-/// decisive fast route.
-fn read_noul(answers: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
-    let value = answers.get(key)?.get("noul")?.as_f64()?;
-    (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
+/// A finite probability in [0, 1], or `None` ("no evidence").
+fn unit_interval(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
 }
 
-/// Read a calibrated confidence only when it is a real, finite value in [0, 1].
-fn read_confidence(answers: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
-    let value = answers.get(key)?.get("confidence")?.as_f64()?;
-    (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
+/// Read a `noul` answer only when it is typed as one and its value is a real
+/// probability. Anything else (absent, wrong type, out of range) is "no
+/// evidence", so a mis-scaled or missing answer can never produce a decisive
+/// fast route.
+fn read_noul(response: &SystemOneResponse, key: &str) -> Option<f64> {
+    let answer = response.answers.get(key)?;
+    (answer.kind == "noul")
+        .then_some(answer.noul)
+        .and_then(unit_interval)
 }
 
 /// Derive a conservative route. The gate only recommends a fast route when the
 /// relevant numbers are decisive; otherwise it says `Unknown` so the caller
 /// falls back to the normal path.
-fn derive_route(answers: &serde_json::Map<String, Value>) -> Route {
-    let needs_tool = read_noul(answers, "needs_tool");
-    let from_context = read_noul(answers, "answerable_from_context");
+fn derive_route(response: &SystemOneResponse) -> Route {
+    let needs_tool = read_noul(response, "needs_tool");
+    let from_context = read_noul(response, "answerable_from_context");
 
     // Decisive "needs a tool" wins first — the harness must not skip work.
     if needs_tool.is_some_and(|nt| nt >= 0.85) {
@@ -217,15 +378,12 @@ fn derive_route(answers: &serde_json::Map<String, Value>) -> Route {
     }
 
     // Clearly chat, with a calibrated intent and a present, low tool-need signal.
-    let intent_is_chat = answers
-        .get("intent")
-        .and_then(|intent| intent.get("choice"))
-        .and_then(|choice| choice.as_str())
-        == Some("chat");
-    if intent_is_chat
-        && read_confidence(answers, "intent").is_some_and(|c| c >= 0.5)
-        && needs_tool.is_some_and(|nt| nt <= 0.2)
-    {
+    let intent_is_calibrated_chat = response.answers.get("intent").is_some_and(|intent| {
+        intent.kind == "choice"
+            && intent.choice.as_deref() == Some("chat")
+            && unit_interval(intent.confidence).is_some_and(|c| c >= 0.5)
+    });
+    if intent_is_calibrated_chat && needs_tool.is_some_and(|nt| nt <= 0.2) {
         return Route::PlainChat;
     }
 
@@ -235,92 +393,395 @@ fn derive_route(answers: &serde_json::Map<String, Value>) -> Route {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-    fn answers(raw: Value) -> serde_json::Map<String, Value> {
-        raw.as_object().unwrap().clone()
+    const TYPESAFE_TEST_KEY: &str = "sf-typesafe-test-key-0123456789";
+
+    /// Fields drop in declaration order: restore the environment before the
+    /// lock is released, or another test observes our overrides.
+    struct Env {
+        _guards: Vec<crate::test_support::EnvVarGuard>,
+        _home: tempfile::TempDir,
+        _lock: crate::test_support::TestEnvLock,
     }
 
-    #[test]
-    fn decisive_tool_need_routes_to_needs_tool() {
-        let a = answers(json!({ "needs_tool": { "noul": 0.9 } }));
-        assert_eq!(derive_route(&a), Route::NeedsTool);
-    }
-
-    #[test]
-    fn answerable_from_context_with_low_tool_need() {
-        let a = answers(json!({
-            "needs_tool": { "noul": 0.1 },
-            "answerable_from_context": { "noul": 0.9 }
-        }));
-        assert_eq!(derive_route(&a), Route::AnswerFromContext);
-    }
-
-    #[test]
-    fn clear_chat_with_calibrated_intent_and_very_low_tool_need() {
-        let a = answers(json!({
-            "needs_tool": { "noul": 0.05 },
-            "intent": { "choice": "chat", "confidence": 0.8 }
-        }));
-        assert_eq!(derive_route(&a), Route::PlainChat);
-    }
-
-    #[test]
-    fn non_finite_and_out_of_range_are_no_evidence() {
-        // NaN/Infinity cannot be expressed in strict JSON, but a wrong-type or
-        // out-of-range value must not route fast.
-        let a = answers(json!({
-            "needs_tool": { "noul": 5.0 },
-            "answerable_from_context": { "noul": "high" }
-        }));
-        assert_eq!(derive_route(&a), Route::Unknown);
-    }
-
-    #[test]
-    fn empty_answers_is_unknown() {
-        let a = answers(json!({}));
-        assert_eq!(derive_route(&a), Route::Unknown);
-    }
-
-    #[test]
-    fn last_user_text_picks_last_user_message_text() {
-        let messages = vec![
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "first".to_string(),
-                    cache_control: None,
-                }],
-            },
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "reply".to_string(),
-                    cache_control: None,
-                }],
-            },
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "  latest question  ".to_string(),
-                    cache_control: None,
-                }],
-            },
+    /// A hermetic home with a TypeSafe key. `gate` switches the gate on
+    /// against the TypeSafe route at that server with that deadline (ms).
+    fn hermetic_env(gate: Option<(&MockServer, u64)>) -> Env {
+        use crate::test_support::EnvVarGuard;
+        let lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("test home");
+        let mut guards = vec![
+            EnvVarGuard::set("CODEWHALE_HOME", home.path()),
+            EnvVarGuard::remove("OPENROUTER_API_KEY"),
+            EnvVarGuard::set("TYPESAFE_API_KEY", TYPESAFE_TEST_KEY),
+            EnvVarGuard::remove(MODEL_VAR),
         ];
-        assert_eq!(
-            last_user_text(&messages).as_deref(),
-            Some("latest question")
+        match gate {
+            Some((server, timeout_ms)) => guards.extend([
+                EnvVarGuard::set(ENABLED_VAR, "1"),
+                EnvVarGuard::set(PROVIDER_VAR, "typesafe"),
+                EnvVarGuard::set(BASE_URL_VAR, format!("{}/v1", server.uri())),
+                EnvVarGuard::set(TIMEOUT_VAR, timeout_ms.to_string()),
+            ]),
+            None => guards.extend([
+                EnvVarGuard::remove(ENABLED_VAR),
+                EnvVarGuard::remove(PROVIDER_VAR),
+                EnvVarGuard::remove(BASE_URL_VAR),
+                EnvVarGuard::remove(TIMEOUT_VAR),
+            ]),
+        }
+        Env {
+            _guards: guards,
+            _home: home,
+            _lock: lock,
+        }
+    }
+
+    /// A chat provider the client can be built from; the gate never calls it.
+    fn config() -> Config {
+        Config {
+            provider: Some("deepseek".to_string()),
+            default_text_model: Some("deepseek-v4-pro".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                deepseek: crate::config::ProviderConfig {
+                    api_key: Some("ds-test-key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn text(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    fn turn(latest: &str) -> Vec<Message> {
+        vec![
+            text(Role::User, "earlier question"),
+            text(Role::Assistant, "earlier answer"),
+            text(Role::User, latest),
+        ]
+    }
+
+    fn noul_body(needs_tool: f64, from_context: f64) -> Value {
+        json!({
+            "id": "sf-1",
+            "model": "jev-latest",
+            "answers": {
+                "needs_tool": { "type": "noul", "noul": needs_tool },
+                "answerable_from_context": { "type": "noul", "noul": from_context },
+                "intent": {
+                    "type": "choice",
+                    "choice": "code_change",
+                    "probabilities": {
+                        "code_change": 0.9, "code_question": 0.04, "command": 0.03,
+                        "chat": 0.02, "other": 0.01
+                    },
+                    "confidence": 0.8
+                }
+            }
+        })
+    }
+
+    async fn requests(server: &MockServer) -> Vec<Request> {
+        server.received_requests().await.expect("recorded")
+    }
+
+    async fn run(messages: &[Message]) -> Option<ShadowOutcome> {
+        let handle = spawn_shadow_gate(&config(), messages)?;
+        Some(handle.await.expect("shadow task"))
+    }
+
+    #[tokio::test]
+    async fn disabled_gate_sends_nothing_and_starts_no_task() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(noul_body(0.9, 0.1)))
+            .mount(&server)
+            .await;
+        let _env = hermetic_env(None);
+
+        assert_eq!(run(&turn("Refactor the parser")).await, None);
+        assert!(
+            requests(&server).await.is_empty(),
+            "a disabled gate must not call"
         );
     }
 
+    #[tokio::test]
+    async fn enabled_gate_posts_one_redacted_bounded_decision_and_recommends() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(header(
+                "authorization",
+                format!("Bearer {TYPESAFE_TEST_KEY}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(noul_body(0.93, 0.1)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _env = hermetic_env(Some((&server, 2_000)));
+
+        // The latest message echoes the key and is longer than the state cap.
+        let latest = format!(
+            "Fix the build. token={TYPESAFE_TEST_KEY} {}",
+            "x".repeat(6_000)
+        );
+        let outcome = run(&turn(&latest)).await.expect("enabled gate runs");
+        assert!(
+            matches!(
+                outcome,
+                ShadowOutcome::Recommendation {
+                    route: Route::NeedsTool,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let requests = requests(&server).await;
+        assert_eq!(requests.len(), 1);
+        let raw = String::from_utf8(requests[0].body.clone()).expect("utf8 body");
+        assert!(
+            !raw.contains(TYPESAFE_TEST_KEY),
+            "key leaked into decision state"
+        );
+        assert!(
+            !raw.contains("earlier question"),
+            "only the latest message is sent"
+        );
+        let body: Value = serde_json::from_str(&raw).expect("json body");
+        assert_eq!(body["model"], "jev-latest");
+        let state = body["state"]["latest_request"]
+            .as_str()
+            .expect("state text");
+        assert!(state.starts_with("Fix the build."));
+        assert!(
+            state.chars().count() <= MAX_STATE_CHARS + 3,
+            "state is bounded"
+        );
+        let questions: Vec<&str> = body["questions"]
+            .as_object()
+            .expect("questions")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            questions,
+            ["needs_tool", "answerable_from_context", "intent"]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_error_and_malformed_answers_fail_open_as_typed_classes() {
+        for (response, expected) in [
+            (
+                ResponseTemplate::new(500).set_body_string("upstream exploded: secret body"),
+                AutoRouterFailure::Http { status: 500 },
+            ),
+            (
+                ResponseTemplate::new(200).set_body_string("not json"),
+                AutoRouterFailure::InvalidAnswer,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/systemone"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let _env = hermetic_env(Some((&server, 2_000)));
+
+            let outcome = run(&turn("Explain the diff"))
+                .await
+                .expect("enabled gate runs");
+            assert!(
+                matches!(outcome, ShadowOutcome::Failed { failure, .. } if failure == expected),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_endpoint_times_out_without_holding_up_the_caller() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(noul_body(0.93, 0.1))
+                    .set_delay(Duration::from_secs(3)),
+            )
+            .mount(&server)
+            .await;
+        let _env = hermetic_env(Some((&server, 100)));
+
+        let started = Instant::now();
+        let handle = spawn_shadow_gate(&config(), &turn("Run the tests")).expect("task");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "spawning must not wait on the decision call"
+        );
+        let outcome = handle.await.expect("shadow task");
+        assert!(
+            matches!(
+                outcome,
+                ShadowOutcome::Failed {
+                    failure: AutoRouterFailure::Timeout,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the deadline bounds the call"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_op_and_unrunnable_turns_send_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(noul_body(0.9, 0.1)))
+            .mount(&server)
+            .await;
+        let _env = hermetic_env(Some((&server, 2_000)));
+
+        // No user text: no task.
+        assert_eq!(run(&[text(Role::Assistant, "only assistant")]).await, None);
+        assert_eq!(run(&turn("   ")).await, None);
+
+        // No TypeSafe key: the route is not runnable and nothing is sent.
+        let _no_key = crate::test_support::EnvVarGuard::remove("TYPESAFE_API_KEY");
+        let outcome = run(&turn("Refactor the parser"))
+            .await
+            .expect("enabled gate runs");
+        assert_eq!(
+            outcome,
+            ShadowOutcome::Failed {
+                failure: AutoRouterFailure::NotRunnable,
+                latency_ms: 0,
+            }
+        );
+        assert!(requests(&server).await.is_empty());
+    }
+
+    fn lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find_map(|(key, value)| (*key == name).then(|| (*value).to_string()))
+        }
+    }
+
     #[test]
-    fn last_user_text_none_when_no_user_message() {
-        let messages = vec![Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: "only assistant".to_string(),
-                cache_control: None,
-            }],
-        }];
-        assert_eq!(last_user_text(&messages), None);
+    fn settings_are_off_by_default_and_misconfiguration_is_named() {
+        assert_eq!(ShadowSettings::from_lookup(lookup(&[])), None);
+        assert_eq!(
+            ShadowSettings::from_lookup(lookup(&[(ENABLED_VAR, "0"), (PROVIDER_VAR, "typesafe")])),
+            None
+        );
+        let missing = ShadowSettings::from_lookup(lookup(&[(ENABLED_VAR, "on")]))
+            .expect("enabled")
+            .expect_err("no provider");
+        assert!(missing.contains(PROVIDER_VAR), "{missing}");
+        let unknown =
+            ShadowSettings::from_lookup(lookup(&[(ENABLED_VAR, "1"), (PROVIDER_VAR, "deepseek")]))
+                .expect("enabled")
+                .expect_err("not a decision route");
+        assert!(unknown.contains("deepseek"), "{unknown}");
+        let timeout = ShadowSettings::from_lookup(lookup(&[
+            (ENABLED_VAR, "1"),
+            (PROVIDER_VAR, "openrouter"),
+            (TIMEOUT_VAR, "0"),
+        ]))
+        .expect("enabled")
+        .expect_err("zero timeout");
+        assert!(timeout.contains(TIMEOUT_VAR), "{timeout}");
+        let settings = ShadowSettings::from_lookup(lookup(&[
+            (ENABLED_VAR, "yes"),
+            (PROVIDER_VAR, "openrouter"),
+        ]))
+        .expect("enabled")
+        .expect("valid");
+        assert_eq!(settings.route, DecisionRouterRoute::Openrouter);
+        assert_eq!(settings.model, "~typesafe/jev-latest");
+        assert_eq!(settings.timeout, Duration::from_millis(DEFAULT_TIMEOUT_MS));
+        assert_eq!(settings.base_url, None);
+    }
+
+    fn response(answers: Value) -> SystemOneResponse {
+        serde_json::from_value(json!({ "answers": answers })).expect("response")
+    }
+
+    #[test]
+    fn only_decisive_typed_answers_route_fast() {
+        let cases = [
+            (
+                json!({ "needs_tool": { "type": "noul", "noul": 0.9 } }),
+                Route::NeedsTool,
+            ),
+            (
+                json!({
+                    "needs_tool": { "type": "noul", "noul": 0.1 },
+                    "answerable_from_context": { "type": "noul", "noul": 0.9 }
+                }),
+                Route::AnswerFromContext,
+            ),
+            (
+                json!({
+                    "needs_tool": { "type": "noul", "noul": 0.05 },
+                    "intent": { "type": "choice", "choice": "chat", "confidence": 0.8 }
+                }),
+                Route::PlainChat,
+            ),
+            // Out of range, wrong type, or untyped answers are no evidence.
+            (
+                json!({
+                    "needs_tool": { "type": "noul", "noul": 5.0 },
+                    "answerable_from_context": { "type": "choice", "noul": 0.95 }
+                }),
+                Route::Unknown,
+            ),
+            (json!({ "needs_tool": { "noul": 0.95 } }), Route::Unknown),
+            // Chat without a present, low tool-need signal is not decisive.
+            (
+                json!({ "intent": { "type": "choice", "choice": "chat", "confidence": 0.9 } }),
+                Route::Unknown,
+            ),
+            (json!({}), Route::Unknown),
+        ];
+        for (answers, expected) in cases {
+            assert_eq!(
+                derive_route(&response(answers.clone())),
+                expected,
+                "{answers}"
+            );
+        }
+    }
+
+    #[test]
+    fn last_user_text_picks_the_latest_user_text() {
+        assert_eq!(
+            last_user_text(&turn("  latest question  ")).as_deref(),
+            Some("latest question")
+        );
+        assert_eq!(
+            last_user_text(&[text(Role::Assistant, "only assistant")]),
+            None
+        );
     }
 }

@@ -1886,7 +1886,7 @@ fn append_router_text(out: &mut String, text: &str) {
     out.push_str(text);
 }
 
-fn truncate_for_auto_router(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_for_auto_router(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
