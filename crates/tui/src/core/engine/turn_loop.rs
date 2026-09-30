@@ -1825,6 +1825,8 @@ impl Engine {
                 drop(crate::superfast::spawn_shadow_gate(
                     &self.api_config,
                     &stream_request.messages,
+                    self.config.compaction.runtime_cost_owner.as_deref(),
+                    &self.cancel_token,
                 ));
             }
             let _ = self

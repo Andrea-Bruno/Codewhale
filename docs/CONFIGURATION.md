@@ -771,8 +771,13 @@ min_confidence = 0.5          # default 0.5, clamped to 0..1
   0.75, or the turn stays on the fast tier.
 - An unknown `kind`, or a decision `provider` other than `openrouter` /
   `typesafe`, leaves the router unconfigured and shown as failing.
-- `thinking` is ignored for decision routers. OpenRouter spend is recorded like
-  any routed usage; TypeSafe-direct spend appears on the receipt only.
+- `thinking` is ignored for decision routers. Both routes settle tokens through
+  the originating session's routed-usage ledger. TypeSafe is a named Custom route
+  with unknown billing; its price is never borrowed from the active chat provider.
+  Provider-reported cost remains verbatim on the decision receipt.
+- OpenRouter uses `POST /api/alpha/decisions`; TypeSafe uses `POST /v1/systemone`.
+  The shared client validates Choice, Noul and Score against the offered questions
+  and bounds responses to 256 KiB. Malformed answers fail open with usage retained.
 
 #### Shadow Decision Gate (experimental, off by default)
 
@@ -800,8 +805,10 @@ SUPERFAST_TIMEOUT_MS=150         # 1..=10000, default 150
 - Only the latest user message is sent, truncated to 4,000 characters and
   redacted of configured secrets. The log (target `superfast`) carries the
   route, failure class and latency, never prompt text.
-- The gate's own spend is the configured endpoint's; it is not added to session
-  cost totals or Auto receipts.
+- The gate retains the originating turn's accounting owner and cancellation.
+  Its tokens settle through the shared ledger; missing usage or a cancelled/timed
+  out request after dispatch creates an explicit coverage gap. Unknown TypeSafe
+  pricing is recorded as unpriced rather than free.
 
 The Decision Gate concept and reference implementation are by Andrea Bruno,
 released under CC BY 4.0:
@@ -3480,3 +3487,9 @@ codewhale sessions scrub-secrets --apply  # rewrite the affected files
 so it never loses a concurrent save. A session that is still open can write
 its in-memory copy back on its next save, so close open sessions first, and
 rotate any credential that was exposed — masking a stored copy cannot un-leak it.
+
+Decision API compatibility uses OpenRouter `/api/alpha/decisions` and TypeSafe
+`/v1/systemone` on the existing authenticated client. Provider-reported cost is
+preserved verbatim in bounded decision receipts on the original turn or session,
+including rejected answers and late shadow responses. Receipts are diagnostic;
+they do not turn unknown pricing into an authoritative dollar total.

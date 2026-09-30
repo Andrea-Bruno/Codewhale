@@ -71,6 +71,8 @@ struct LateUsageRecord {
     route: crate::cost_status::EffectiveRouteEnvelope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     usage: Option<codewhale_models::Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision: Option<crate::cost_status::RuntimeDecisionReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1681,6 +1683,7 @@ impl SessionManager {
             || ledger.records.iter().any(|record| {
                 !is_sha256_fingerprint(&record.source_fingerprint)
                     || !is_sha256_fingerprint(&record.turn_fingerprint)
+                    || record.decision.as_ref().is_some_and(|r| !r.is_bounded())
             })
         {
             return Err(io::Error::new(
@@ -1742,6 +1745,7 @@ impl SessionManager {
         source_id: &str,
         route: &crate::cost_status::EffectiveRouteEnvelope,
         usage: Option<&codewhale_models::Usage>,
+        decision: Option<&crate::cost_status::RuntimeDecisionReceipt>,
     ) -> io::Result<bool> {
         let (path, lock_path) = self.ensure_late_usage_paths(session_id)?;
         let lock_file = open_private_lock_file(&lock_path)?;
@@ -1753,11 +1757,21 @@ impl SessionManager {
         }
         let mut ledger = Self::load_late_usage_unlocked(&path)?;
         let source_fingerprint = crate::cost_status::usage_source_fingerprint(source_id);
-        if ledger
+        if let Some(record) = ledger
             .records
-            .iter()
-            .any(|record| record.source_fingerprint == source_fingerprint)
+            .iter_mut()
+            .find(|record| record.source_fingerprint == source_fingerprint)
         {
+            if let Some(decision) = decision {
+                if !decision.is_bounded() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decision receipt exceeds its bound",
+                    ));
+                }
+                record.decision = Some(decision.sanitized());
+                Self::write_late_usage_ledger(&path, &ledger)?;
+            }
             return Ok(true);
         }
         if ledger.records.len() == MAX_LATE_USAGE_RECORDS_PER_SESSION {
@@ -1772,9 +1786,46 @@ impl SessionManager {
             turn_fingerprint: crate::cost_status::usage_source_fingerprint(turn_id),
             route: route.sanitized_for_persistence(),
             usage: usage.cloned(),
+            decision: decision.map(crate::cost_status::RuntimeDecisionReceipt::sanitized),
         });
         Self::write_late_usage_ledger(&path, &ledger)?;
         Ok(true)
+    }
+
+    pub(crate) fn persist_late_decision_receipt(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        receipt: &crate::cost_status::RuntimeDecisionReceipt,
+    ) -> io::Result<bool> {
+        if !receipt.is_bounded() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decision receipt exceeds its bound",
+            ));
+        }
+        self.persist_late_usage_record(
+            session_id,
+            turn_id,
+            &receipt.source_id,
+            &receipt.route,
+            receipt.usage.as_ref(),
+            Some(receipt),
+        )
+    }
+
+    /// Read the bounded provider decision evidence from the existing origin ledger.
+    #[cfg(test)]
+    pub(crate) fn decision_receipts_for_session(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Vec<crate::cost_status::RuntimeDecisionReceipt>> {
+        Ok(self
+            .load_late_usage(session_id)?
+            .records
+            .into_iter()
+            .filter_map(|record| record.decision)
+            .collect())
     }
 
     pub(crate) fn persist_late_runtime_usage(
@@ -1789,6 +1840,7 @@ impl SessionManager {
             &record.source_id,
             &record.usage.route,
             Some(&record.usage.usage),
+            None,
         )
     }
 
@@ -1798,7 +1850,14 @@ impl SessionManager {
         turn_id: &str,
         record: &crate::cost_status::RuntimeUsageDropRecord,
     ) -> io::Result<bool> {
-        self.persist_late_usage_record(session_id, turn_id, &record.source_id, &record.route, None)
+        self.persist_late_usage_record(
+            session_id,
+            turn_id,
+            &record.source_id,
+            &record.route,
+            None,
+            None,
+        )
     }
 
     fn with_session_read_lock<T>(
@@ -1863,6 +1922,14 @@ impl SessionManager {
             }
         };
         for record in ledger.records {
+            if let Some(receipt) = &record.decision {
+                if receipt.is_bounded() {
+                    metadata
+                        .cost
+                        .route_receipts
+                        .insert(receipt.diagnostic_receipt());
+                }
+            }
             let source_fingerprint = record.source_fingerprint.clone();
             let source_id = format!("late:{}", record.source_fingerprint);
             let mut pending = if let Some(usage) = record.usage.as_ref() {
@@ -4146,6 +4213,90 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn decision_receipt_survives_restart_replay_and_session_deletion() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        save_late_usage_test_session(&manager, "decision-origin");
+        let receipt = crate::cost_status::decision_receipt_fixture("raw-decision-response-id");
+        manager
+            .persist_late_decision_receipt("decision-origin", "origin-turn", &receipt)
+            .expect("decision append");
+        manager
+            .persist_late_runtime_usage(
+                "decision-origin",
+                "origin-turn",
+                &crate::cost_status::RuntimeUsageRecord {
+                    source_id: receipt.source_id.clone(),
+                    usage: crate::cost_status::EffectiveRouteUsage {
+                        route: receipt.route.clone(),
+                        usage: receipt.usage.clone().expect("usage"),
+                    },
+                },
+            )
+            .expect("token append dedupes");
+        drop(manager);
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("restart");
+        let retained = manager
+            .decision_receipts_for_session("decision-origin")
+            .expect("receipts");
+        assert_eq!(retained, vec![receipt.sanitized()]);
+        let mut restored = manager
+            .load_session_snapshot("decision-origin")
+            .expect("restore");
+        assert_eq!(restored.metadata.total_tokens, 13);
+        assert_eq!(
+            restored.metadata.cost.unpriced_turns, 1,
+            "unknown TypeSafe billing remains explicit"
+        );
+        assert!(
+            restored
+                .metadata
+                .cost
+                .route_receipts
+                .iter()
+                .any(|r| r.contains("0.000012054"))
+        );
+        manager.apply_late_usage_to_metadata(&mut restored.metadata);
+        assert_eq!(
+            restored.metadata.total_tokens, 13,
+            "replay must not count tokens twice"
+        );
+        assert_eq!(restored.metadata.cost.unpriced_turns, 1);
+        manager.save_session(&restored).expect("save overlay");
+        assert_eq!(
+            manager
+                .load_session_snapshot("decision-origin")
+                .expect("resume again")
+                .metadata
+                .total_tokens,
+            13
+        );
+        let (ledger, _) = manager.late_usage_paths("decision-origin").expect("paths");
+        assert!(
+            !fs::read_to_string(&ledger)
+                .expect("ledger")
+                .contains("raw-decision-response-id")
+        );
+        manager.delete_session("decision-origin").expect("delete");
+        assert!(
+            manager
+                .persist_late_decision_receipt("decision-origin", "origin-turn", &receipt)
+                .expect("retired replay")
+        );
+        assert!(
+            !ledger.exists(),
+            "late evidence must never recreate a deleted origin"
+        );
+        let mut oversized = receipt;
+        oversized.evidence.response_model = Some("x".repeat(129));
+        assert!(
+            manager
+                .persist_late_decision_receipt("decision-origin", "origin-turn", &oversized)
+                .is_err()
+        );
     }
 
     #[test]

@@ -2,9 +2,9 @@
 //!
 //! `[auto.router] kind = "decision"` asks a non-generative decision model
 //! (TypeSafe's Jev) one typed Choice per turn. The wire is a plain JSON
-//! `POST {base}/systemone` — not chat completions — served on two routes:
+//! `POST to the route’s decision endpoint` — not chat completions — served on two routes:
 //!
-//! * **OpenRouter** — `{openrouter base}/systemone` with the user's OpenRouter
+//! * **OpenRouter** — `https://openrouter.ai/api/alpha/decisions` with the user's OpenRouter
 //!   key, built exactly like every other OpenRouter client.
 //! * **TypeSafe direct** — `https://api.typesafe.ai/v1/systemone` with a
 //!   TypeSafe key.
@@ -16,13 +16,15 @@
 //! * TypeSafe is **not** an [`ApiProvider`]: it serves no chat route, so it is
 //!   the decision router's own endpoint + key (`TYPESAFE_API_KEY`, the
 //!   `typesafe` secret-store slot, or `[providers.typesafe] api_key` /
-//!   `api_key_env`). Its spend is shown on the Auto receipt as the
-//!   provider-reported cost; it is not entered in session cost totals.
+//!   `api_key_env`). Its tokens enter the shared usage ledger under a frozen
+//!   `custom` / `typesafe` route with unknown billing; reported cost is retained
+//!   on decision receipts. Unknown pricing is never interpreted as free.
 //! * The routing call makes one attempt (no retry): it is bounded by the
 //!   router timeout, and a retried decision would arrive after the turn has
 //!   already fallen back.
 //! * The router parses the `choice` answer shape; the shadow Decision Gate
-//!   (`crate::superfast`) also reads `noul`. `score` is not parsed.
+//!   (`crate::superfast`) also reads `noul`. The transport strictly validates
+//!   Choice, Noul and fractional Score responses before either policy uses them.
 
 use std::collections::BTreeMap;
 
@@ -38,6 +40,9 @@ pub(crate) const TYPESAFE_DEFAULT_BASE_URL: &str = "https://api.typesafe.ai/v1";
 pub(crate) const TYPESAFE_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 /// Secret-store slot and `[providers.<name>]` table name for the TypeSafe key.
 pub(crate) const TYPESAFE_KEY_NAME: &str = "typesafe";
+/// Bound a non-generative decision response before allocating/decoding it.
+const DECISION_RESPONSE_MAX_BYTES: usize = 256 * 1024;
+const DECISION_REQUEST_MAX_BYTES: usize = 1024 * 1024;
 
 /// Which endpoint serves a decision router.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +133,10 @@ pub(crate) struct SystemOneResponse {
     pub(crate) answers: BTreeMap<String, SystemOneAnswer>,
     #[serde(default)]
     pub(crate) usage: Option<SystemOneUsage>,
+    /// Transport validation is separate from decoding so a rejected policy
+    /// answer still preserves the provider's usage/cost evidence.
+    #[serde(skip)]
+    pub(crate) answers_validated: Option<bool>,
 }
 
 /// One answer. The `choice` and `noul` subsets are interpreted.
@@ -140,6 +149,10 @@ pub(crate) struct SystemOneAnswer {
     /// A `noul` answer's probability; validated by its reader.
     #[serde(default)]
     pub(crate) noul: Option<f64>,
+    #[serde(default)]
+    pub(crate) score: Option<f64>,
+    #[serde(default)]
+    pub(crate) legend: BTreeMap<String, Value>,
     #[serde(default)]
     pub(crate) probabilities: BTreeMap<String, Option<f64>>,
     #[serde(default)]
@@ -166,7 +179,7 @@ impl SystemOneUsage {
     pub(crate) fn reported_cost(&self) -> Option<String> {
         let raw = self.cost.as_ref()?.get().trim();
         let value: f64 = raw.parse().ok()?;
-        (value.is_finite() && value >= 0.0).then(|| raw.to_string())
+        (raw.len() <= 128 && value.is_finite() && value >= 0.0).then(|| raw.to_string())
     }
 }
 
@@ -176,8 +189,8 @@ impl CodewhaleClient {
     /// OpenRouter is the ordinary OpenRouter client (its key, base URL,
     /// attribution headers). TypeSafe re-points a clone of the active route's
     /// client — keeping its retry, TLS and redaction policy — at the TypeSafe
-    /// endpoint with the TypeSafe key only, and drops the active provider's
-    /// concurrency permit so a routing call never holds a chat slot.
+    /// endpoint with the TypeSafe key only. Its captured request budget and
+    /// remote-control ownership continue to apply to the one decision attempt.
     pub(crate) fn for_decision_route(
         config: &Config,
         route: DecisionRouterRoute,
@@ -216,6 +229,15 @@ impl CodewhaleClient {
                 )?
                 .build()?;
                 client.base_url = base_url;
+                client.http1_client = client.http_client.clone();
+                // Repointing auth/URL must also replace the inherited chat
+                // route identity. No TypeSafe price/product is guessed.
+                client.api_provider = ApiProvider::Custom;
+                client.provider_identity = TYPESAFE_KEY_NAME.to_string();
+                client.openrouter_vendor = None;
+                client.billing_surface = None;
+                client.billing_mode = crate::cost_status::RouteBillingMode::Unknown;
+                client.route_limits = None;
                 // `Self::new` froze the redaction set from the chat provider's
                 // secrets; the TypeSafe key is none of them, so add it before
                 // any decision body is built from untrusted context.
@@ -223,15 +245,13 @@ impl CodewhaleClient {
                 push_model_bound_secret(&mut secrets, Some(&key));
                 client.model_bound_secret_values = Arc::new(secrets);
                 client.api_key = key;
-                client.request_concurrency = None;
-                client.remote_control_inference_participant = false;
                 Ok(client)
             }
         }
     }
 
-    /// `POST {base}/systemone` once, isolated like the Auto chat classifier:
-    /// no global retry banners, no shared token bucket, no response cache.
+    /// `POST to the route’s decision endpoint` once, isolated like the Auto chat classifier:
+    /// no global retry banners or response cache; shared admission still applies.
     ///
     /// Only a failure class leaves this function — provider error bodies can
     /// echo the prompt and must never reach receipts.
@@ -244,24 +264,145 @@ impl CodewhaleClient {
         body: &Value,
         dispatched: &std::sync::atomic::AtomicBool,
     ) -> std::result::Result<SystemOneResponse, AutoRouterFailure> {
+        if serde_json::to_vec(body).map_or(true, |bytes| bytes.len() > DECISION_REQUEST_MAX_BYTES)
+            || !valid_decision_request(body)
+        {
+            return Err(AutoRouterFailure::NotRunnable);
+        }
         let mut isolated = self.clone();
         isolated.isolated_request_state = true;
-        isolated.rate_limiter = Arc::new(AsyncMutex::new(TokenBucket::from_env()));
         isolated.retry.max_retries = 0;
         let _inference = isolated.acquire_remote_control_inference_permit().await;
         let _permit = isolated.acquire_provider_request_permit().await;
-        let url = api_url(&isolated.base_url, "systemone");
+        let url = if isolated.api_provider == ApiProvider::Openrouter {
+            // The OpenRouter Decisions API is a sibling of /api/v1, so keep
+            // the configured origin/proxy prefix and replace only /v1.
+            let mut url = reqwest::Url::parse(&isolated.base_url)
+                .map_err(|_| AutoRouterFailure::NotRunnable)?;
+            let prefix = url.path().trim_end_matches('/').trim_end_matches("/v1");
+            url.set_path(&format!("{prefix}/alpha/decisions"));
+            url.to_string()
+        } else {
+            api_url(&isolated.base_url, "systemone")
+        };
+        isolated.wait_for_rate_limit().await;
         dispatched.store(true, std::sync::atomic::Ordering::Release);
         let response = isolated
             .send_json_with_retry(&url, body)
             .await
             .map_err(|error| router_failure_from_error(&error))?;
-        let bytes = response
-            .bytes()
+        let text = bounded_provider_catalog_text(response, DECISION_RESPONSE_MAX_BYTES)
             .await
-            .map_err(|_| AutoRouterFailure::Transport)?;
-        serde_json::from_slice(&bytes).map_err(|_| AutoRouterFailure::InvalidAnswer)
+            .map_err(|error| match error {
+                CatalogRefreshError::Network => AutoRouterFailure::Transport,
+                _ => AutoRouterFailure::InvalidAnswer,
+            })?;
+        let mut response: SystemOneResponse =
+            serde_json::from_str(&text).map_err(|_| AutoRouterFailure::InvalidAnswer)?;
+        response.answers_validated = Some(valid_decision_response(body, &response));
+        response.model = response.model.map(|model| {
+            self.redact_model_bound_text(&model)
+                .chars()
+                .take(128)
+                .collect()
+        });
+        Ok(response)
     }
+}
+
+fn valid_decision_request(body: &Value) -> bool {
+    let Some(questions) = body.get("questions").and_then(Value::as_object) else {
+        return false;
+    };
+    let model = body.get("model").and_then(Value::as_str);
+    model.is_some_and(|m| !m.trim().is_empty() && m.len() <= 256)
+        && body.get("state").is_some_and(|state| {
+            matches!(state, Value::String(_) | Value::Object(_) | Value::Array(_))
+        })
+        && !questions.is_empty()
+        && questions.len() <= 64
+        && questions
+            .values()
+            .all(|q| match q.get("type").and_then(Value::as_str) {
+                Some("noul") => true,
+                Some("choice") => q
+                    .get("criteria")
+                    .and_then(Value::as_object)
+                    .is_some_and(|c| !c.is_empty() && c.len() <= 64),
+                Some("score") => q
+                    .get("criteria")
+                    .and_then(Value::as_array)
+                    .is_some_and(|c| !c.is_empty() && c.len() <= 10),
+                _ => false,
+            })
+}
+
+fn valid_decision_response(body: &Value, response: &SystemOneResponse) -> bool {
+    let Some(questions) = body.get("questions").and_then(Value::as_object) else {
+        return false;
+    };
+    response
+        .model
+        .as_deref()
+        .is_some_and(|m| !m.trim().is_empty() && m.len() <= 256)
+        && response.usage.is_some()
+        && response.answers.len() == questions.len()
+        && questions.iter().all(|(name, question)| {
+            let Some(answer) = response.answers.get(name) else {
+                return false;
+            };
+            if Some(answer.kind.as_str()) != question.get("type").and_then(Value::as_str) {
+                return false;
+            }
+            match answer.kind.as_str() {
+                "noul" => answer
+                    .noul
+                    .is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v)),
+                "choice" => {
+                    let Some(criteria) = question.get("criteria").and_then(Value::as_object) else {
+                        return false;
+                    };
+                    let options = criteria.keys().map(String::as_str).collect::<Vec<_>>();
+                    crate::model_routing::validated_choice(Some(answer), &options).is_some()
+                }
+                "score" => {
+                    let Some(criteria) = question.get("criteria").and_then(Value::as_array) else {
+                        return false;
+                    };
+                    let Some(score) = answer.score else {
+                        return false;
+                    };
+                    if !score.is_finite()
+                        || !(0.0..=(criteria.len() - 1) as f64).contains(&score)
+                        || !answer
+                            .confidence
+                            .is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v))
+                        || answer.legend.len() != criteria.len()
+                        || answer.probabilities.len() != criteria.len()
+                    {
+                        return false;
+                    }
+                    let mut sum = 0.0;
+                    let mut expected_score = 0.0;
+                    for (level, criterion) in criteria.iter().enumerate() {
+                        let key = level.to_string();
+                        let Some(Some(probability)) = answer.probabilities.get(&key) else {
+                            return false;
+                        };
+                        if answer.legend.get(&key) != Some(criterion)
+                            || !probability.is_finite()
+                            || !(0.0..=1.0).contains(probability)
+                        {
+                            return false;
+                        }
+                        sum += probability;
+                        expected_score += level as f64 * probability;
+                    }
+                    (sum - 1.0).abs() <= 0.02 && (score - expected_score).abs() <= 0.02
+                }
+                _ => false,
+            }
+        })
 }
 
 /// Collapse a client error into a non-secret failure class. The HTTP status
@@ -290,6 +431,91 @@ pub(crate) fn router_failure_from_error(error: &anyhow::Error) -> AutoRouterFail
             }),
         LlmError::NetworkError(_) | LlmError::Timeout(_) | LlmError::ParseError(_) => {
             AutoRouterFailure::Transport
+        }
+    }
+}
+
+#[cfg(test)]
+mod decisions_compatibility_tests {
+    use super::*;
+
+    fn request() -> Value {
+        json!({"model":"typesafe/jev-1.13", "state":{"ticket":"charged twice"}, "questions": {
+            "intent": {"type":"choice", "criteria":{"billing":"money", "other":"anything else"}},
+            "refund": {"type":"noul", "instructions":"Does it ask for a refund?"},
+            "urgency": {"type":"score", "criteria":["Can wait", "Needs attention this week", "Needs attention today"]}
+        }})
+    }
+
+    fn response() -> Value {
+        json!({"id":"fixture-decision", "model":"typesafe/jev-1.13-20260917", "usage":{"input_tokens":287,"output_tokens":20,"cost":0.000012054}, "answers": {
+            "intent":{"type":"choice","choice":"billing","confidence":0.9,"probabilities":{"billing":0.9,"other":0.1}},
+            "refund":{"type":"noul","noul":0.99},
+            "urgency":{"type":"score","score":1.7,"confidence":0.9,"legend":{"0":"Can wait","1":"Needs attention this week","2":"Needs attention today"},"probabilities":{"0":0.1,"1":0.1,"2":0.8}}
+        }})
+    }
+
+    #[test]
+    fn all_documented_primitives_validate_without_rescaling_score() {
+        let decoded: SystemOneResponse =
+            serde_json::from_value(response()).expect("documented fixture");
+        assert!(valid_decision_request(&request()));
+        assert!(valid_decision_response(&request(), &decoded));
+        assert_eq!(decoded.answers["urgency"].score, Some(1.7));
+        assert_eq!(
+            decoded.usage.expect("usage").reported_cost().as_deref(),
+            Some("0.000012054")
+        );
+    }
+
+    #[test]
+    fn wrong_types_unoffered_choices_scores_and_partial_shapes_are_rejected() {
+        let changes = [
+            ("/answers/refund/noul", json!(1.01)),
+            ("/answers/refund/type", json!("score")),
+            ("/answers/intent/choice", json!("not-offered")),
+            ("/answers/intent/choice", json!("other")),
+            ("/answers/intent/confidence", json!(-0.1)),
+            ("/answers/intent/probabilities", json!({"billing":0.9})),
+            (
+                "/answers/intent/probabilities",
+                json!({"billing":0.6,"other":0.6}),
+            ),
+            ("/answers/urgency/score", json!(2.01)),
+            ("/answers/urgency/score", json!(0.5)),
+            ("/answers/urgency/legend/1", json!("different rubric")),
+            ("/answers/urgency/probabilities/1", Value::Null),
+            ("/answers/urgency/confidence", json!(1.1)),
+            ("/model", Value::Null),
+            ("/usage", Value::Null),
+            ("/answers", json!({})),
+        ];
+        for (pointer, value) in changes {
+            let mut body = response();
+            *body.pointer_mut(pointer).expect("fixture field") = value;
+            let decoded: SystemOneResponse =
+                serde_json::from_value(body).expect("structural decode");
+            assert!(
+                !valid_decision_response(&request(), &decoded),
+                "accepted {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_in_memory_answers_and_unbounded_request_shapes_are_rejected() {
+        let mut decoded: SystemOneResponse = serde_json::from_value(response()).expect("fixture");
+        decoded.answers.get_mut("refund").expect("noul").noul = Some(f64::NAN);
+        assert!(!valid_decision_response(&request(), &decoded));
+        let mut decoded: SystemOneResponse = serde_json::from_value(response()).expect("fixture");
+        decoded.answers.get_mut("urgency").expect("score").score = Some(f64::INFINITY);
+        assert!(!valid_decision_response(&request(), &decoded));
+        for shape in [
+            json!({}),
+            json!({"model":"jev", "state":"hello", "questions":{}}),
+            json!({"model":"jev", "state":"hello", "questions":{"q":{"type":"score","criteria":vec!["level";11]}}}),
+        ] {
+            assert!(!valid_decision_request(&shape));
         }
     }
 }

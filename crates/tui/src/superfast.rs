@@ -44,8 +44,9 @@
 //!   - The TypeSafe route needs a TypeSafe key even for a self-hosted server
 //!     (the transport always authenticates); a server that ignores auth can
 //!     be given any placeholder key.
-//!   - The gate's own spend is the configured endpoint's and is not entered
-//!     in session cost totals or Auto receipts.
+//!   - Usage settles through the originating turn's shared ledger. Missing
+//!     usage or cancellation after dispatch records a coverage gap. TypeSafe
+//!     is an unpriced Custom route until a billing basis is reviewed.
 //!   - Misconfiguration while enabled (missing or unknown provider, bad
 //!     timeout, missing key) is logged at `warn` for each turn and nothing is
 //!     sent.
@@ -56,7 +57,7 @@
 //! (Von, OpenJev, Laya) are third-party open models; only the integration
 //! architecture and the routing method here are covered by that attribution.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -67,7 +68,53 @@ use codewhale_core::role::Role;
 use crate::client::CodewhaleClient;
 use crate::client::system_one::{DecisionRouterRoute, SystemOneResponse};
 use crate::config::Config;
-use crate::model_routing::{AutoRouterFailure, truncate_for_auto_router};
+use crate::model_routing::{
+    AutoRouterFailure, auto_route_usage_source_id, decision_usage_batch, truncate_for_auto_router,
+};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+struct ShadowUsageContext {
+    scope: crate::cost_status::CostScopeToken,
+    runtime_owner: Option<String>,
+    // Retains the origin's existing durable ledger until settlement finishes.
+    _lease: Option<crate::cost_status::RuntimeUsageLease>,
+    #[cfg(test)]
+    test_origin: std::thread::ThreadId,
+}
+
+impl ShadowUsageContext {
+    fn capture(owner: Option<&str>) -> Self {
+        Self {
+            scope: crate::cost_status::scope_token(),
+            runtime_owner: owner.map(str::to_owned),
+            _lease: owner.and_then(crate::cost_status::acquire_runtime_usage_lease),
+            #[cfg(test)]
+            test_origin: crate::cost_status::test_cost_scope_id(),
+        }
+    }
+
+    async fn report(&self, batch: crate::cost_status::RuntimeUsageBatch) {
+        let context = self.clone();
+        // Existing sinks may write the origin-session ledger. Keep their
+        // filesystem/SQLite work off Tokio workers as well.
+        let settled = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _origin = crate::cost_status::bind_test_cost_scope(context.test_origin);
+            crate::cost_status::report_runtime_usage_batch(
+                context.scope,
+                context.runtime_owner.as_deref(),
+                &batch,
+            );
+            // Release the lease while its captured test binding is still live.
+            drop(context);
+        })
+        .await;
+        if settled.is_err() {
+            tracing::warn!(target: "superfast", "decision usage settlement worker failed");
+        }
+    }
+}
 
 /// Master switch. The gate never runs unless this env var is truthy.
 const ENABLED_VAR: &str = "SUPERFAST_ENABLED";
@@ -207,13 +254,15 @@ fn last_user_text(messages: &[Message]) -> Option<String> {
 }
 
 /// Fire the shadow gate for a turn's first model request. Returns at once:
-/// the evaluation runs on a detached task and only logs. No task is started
+/// the detached evaluation uses the turn's cancellation and accounting owner. No task is started
 /// (and `None` is returned) when the gate is off or misconfigured, when there
 /// is no user text, or when no Tokio runtime is present. The handle exists
 /// for tests; the turn loop drops it.
 pub(crate) fn spawn_shadow_gate(
     config: &Config,
     messages: &[Message],
+    runtime_owner: Option<&str>,
+    cancel_token: &CancellationToken,
 ) -> Option<tokio::task::JoinHandle<ShadowOutcome>> {
     let settings = match ShadowSettings::from_env()? {
         Ok(settings) => settings,
@@ -225,8 +274,18 @@ pub(crate) fn spawn_shadow_gate(
     let latest_request = last_user_text(messages)?;
     let runtime = tokio::runtime::Handle::try_current().ok()?;
     let config = config.clone();
+    // Capture before detaching; the next session/turn must never acquire it.
+    let usage_context = ShadowUsageContext::capture(runtime_owner);
+    let cancel_token = cancel_token.clone();
     Some(runtime.spawn(async move {
-        let outcome = evaluate(&config, &settings, &latest_request).await;
+        let outcome = evaluate(
+            &config,
+            &settings,
+            &latest_request,
+            &usage_context,
+            &cancel_token,
+        )
+        .await;
         log_outcome(outcome);
         outcome
     }))
@@ -264,7 +323,15 @@ async fn evaluate(
     config: &Config,
     settings: &ShadowSettings,
     latest_request: &str,
+    usage_context: &ShadowUsageContext,
+    cancel_token: &CancellationToken,
 ) -> ShadowOutcome {
+    if cancel_token.is_cancelled() {
+        return ShadowOutcome::Failed {
+            failure: AutoRouterFailure::Cancelled,
+            latency_ms: 0,
+        };
+    }
     // Client construction resolves keys (environment, secret store), so it
     // runs off the async worker (#6149).
     let built = {
@@ -287,27 +354,95 @@ async fn evaluate(
         };
     };
     let body = decision_body(&client, &settings.model, latest_request);
+    let request_route = client.effective_route_envelope(&settings.model, chrono::Utc::now());
     let dispatched = AtomicBool::new(false);
     let started = Instant::now();
-    let answer = tokio::time::timeout(
-        settings.timeout,
-        client.system_one_decide(&body, &dispatched),
-    )
-    .await;
+    let answer = tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => Err(AutoRouterFailure::Cancelled),
+        result = tokio::time::timeout(settings.timeout, client.system_one_decide(&body, &dispatched)) => {
+            result.unwrap_or(Err(AutoRouterFailure::Timeout))
+        }
+    };
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match answer {
-        Err(_) => ShadowOutcome::Failed {
-            failure: AutoRouterFailure::Timeout,
-            latency_ms,
-        },
-        Ok(Err(failure)) => ShadowOutcome::Failed {
-            failure,
-            latency_ms,
-        },
-        Ok(Ok(response)) => ShadowOutcome::Recommendation {
-            route: derive_route(&response),
-            latency_ms,
-        },
+        Err(failure) => {
+            if dispatched.load(Ordering::Acquire) {
+                usage_context
+                    .report(crate::cost_status::RuntimeUsageBatch {
+                        decisions: Vec::new(),
+                        drop_records: vec![crate::cost_status::RuntimeUsageDropRecord {
+                            source_id: auto_route_usage_source_id(
+                                &request_route,
+                                "shadow:dispatched-unreceipted",
+                            ),
+                            route: request_route.sanitized_for_persistence(),
+                        }],
+                        dropped_records: 1,
+                        ..Default::default()
+                    })
+                    .await;
+            }
+            ShadowOutcome::Failed {
+                failure,
+                latency_ms,
+            }
+        }
+        Ok(response) => {
+            // Billing evidence settles even when strict answer validation
+            // prevents the policy from producing a recommendation.
+            let mut batch = decision_usage_batch(&request_route, &response);
+            let intent = crate::model_routing::validated_choice(
+                response.answers.get("intent"),
+                &["code_change", "code_question", "command", "chat", "other"],
+            );
+            batch
+                .decisions
+                .push(crate::cost_status::RuntimeDecisionReceipt {
+                    source_id: auto_route_usage_source_id(
+                        &request_route,
+                        response.id.as_deref().unwrap_or("systemone"),
+                    ),
+                    route: request_route.sanitized_for_persistence(),
+                    usage: response.usage.as_ref().map(|u| codewhale_models::Usage {
+                        input_tokens: u.input_tokens,
+                        output_tokens: u.output_tokens,
+                        ..Default::default()
+                    }),
+                    shadow: true,
+                    valid_answers: response.answers_validated != Some(false),
+                    evidence: crate::model_routing::AutoRouteDecisionEvidence {
+                        choice: intent
+                            .as_ref()
+                            .map_or_else(|| "invalid".to_string(), |v| v.choice.clone()),
+                        probabilities_bp: intent
+                            .as_ref()
+                            .map_or_else(Default::default, |v| v.probabilities_bp.clone()),
+                        confidence_bp: intent.as_ref().map_or(0, |v| v.confidence_bp),
+                        min_confidence_bp: 5_000,
+                        cost_saving_kept_fast: false,
+                        thinking: None,
+                        provider_reported_cost_usd: response
+                            .usage
+                            .as_ref()
+                            .and_then(|u| u.reported_cost()),
+                        latency_ms,
+                        response_model: response.model.clone(),
+                    },
+                });
+            usage_context.report(batch).await;
+            if response.answers_validated == Some(false) {
+                ShadowOutcome::Failed {
+                    failure: AutoRouterFailure::InvalidAnswer,
+                    latency_ms,
+                }
+            } else {
+                ShadowOutcome::Recommendation {
+                    route: derive_route(&response),
+                    latency_ms,
+                }
+            }
+        }
     }
 }
 
@@ -378,11 +513,11 @@ fn derive_route(response: &SystemOneResponse) -> Route {
     }
 
     // Clearly chat, with a calibrated intent and a present, low tool-need signal.
-    let intent_is_calibrated_chat = response.answers.get("intent").is_some_and(|intent| {
-        intent.kind == "choice"
-            && intent.choice.as_deref() == Some("chat")
-            && unit_interval(intent.confidence).is_some_and(|c| c >= 0.5)
-    });
+    let intent_is_calibrated_chat = crate::model_routing::validated_choice(
+        response.answers.get("intent"),
+        &["code_change", "code_question", "command", "chat", "other"],
+    )
+    .is_some_and(|intent| intent.choice == "chat" && intent.confidence_bp >= 5_000);
     if intent_is_calibrated_chat && needs_tool.is_some_and(|nt| nt <= 0.2) {
         return Route::PlainChat;
     }
@@ -477,6 +612,7 @@ mod tests {
         json!({
             "id": "sf-1",
             "model": "jev-latest",
+            "usage": { "input_tokens": 121, "output_tokens": 8 },
             "answers": {
                 "needs_tool": { "type": "noul", "noul": needs_tool },
                 "answerable_from_context": { "type": "noul", "noul": from_context },
@@ -498,7 +634,7 @@ mod tests {
     }
 
     async fn run(messages: &[Message]) -> Option<ShadowOutcome> {
-        let handle = spawn_shadow_gate(&config(), messages)?;
+        let handle = spawn_shadow_gate(&config(), messages, None, &CancellationToken::new())?;
         Some(handle.await.expect("shadow task"))
     }
 
@@ -629,7 +765,13 @@ mod tests {
         let _env = hermetic_env(Some((&server, 100)));
 
         let started = Instant::now();
-        let handle = spawn_shadow_gate(&config(), &turn("Run the tests")).expect("task");
+        let handle = spawn_shadow_gate(
+            &config(),
+            &turn("Run the tests"),
+            None,
+            &CancellationToken::new(),
+        )
+        .expect("task");
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "spawning must not wait on the decision call"
@@ -744,7 +886,8 @@ mod tests {
             (
                 json!({
                     "needs_tool": { "type": "noul", "noul": 0.05 },
-                    "intent": { "type": "choice", "choice": "chat", "confidence": 0.8 }
+                    "intent": { "type": "choice", "choice": "chat", "confidence": 0.8,
+                        "probabilities": { "chat": 0.9, "code_change": 0.04, "code_question": 0.03, "command": 0.02, "other": 0.01 } }
                 }),
                 Route::PlainChat,
             ),
@@ -783,5 +926,202 @@ mod tests {
             last_user_text(&[text(Role::Assistant, "only assistant")]),
             None
         );
+    }
+    #[tokio::test]
+    async fn cancelled_before_dispatch_sends_nothing() {
+        let server = MockServer::start().await;
+        let _env = hermetic_env(Some((&server, 2_000)));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = spawn_shadow_gate(&config(), &turn("hi"), None, &cancel)
+            .expect("task")
+            .await
+            .expect("joined");
+        assert!(matches!(
+            outcome,
+            ShadowOutcome::Failed {
+                failure: AutoRouterFailure::Cancelled,
+                ..
+            }
+        ));
+        assert!(requests(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatched_call_records_gap_for_its_owner() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(2))
+                    .set_body_json(noul_body(0.9, 0.1)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _env = hermetic_env(Some((&server, 3_000)));
+        let owner = "superfast-cancel-owner";
+        let dropped = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = dropped.clone();
+        crate::cost_status::register_runtime_usage_sink_with_drop(
+            owner,
+            std::sync::Arc::new(|_| true),
+            Some(std::sync::Arc::new(move |record| {
+                sink.lock().expect("drop sink").push(record);
+                true
+            })),
+        );
+
+        let cancel = CancellationToken::new();
+        let handle = spawn_shadow_gate(&config(), &turn("hi"), Some(owner), &cancel).expect("task");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests(&server).await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request admitted");
+        let start = Instant::now();
+        cancel.cancel();
+        let outcome = tokio::time::timeout(Duration::from_millis(300), handle)
+            .await
+            .expect("cancellation stops the pending request")
+            .expect("joined");
+        assert!(matches!(
+            outcome,
+            ShadowOutcome::Failed {
+                failure: AutoRouterFailure::Cancelled,
+                ..
+            }
+        ));
+        assert!(start.elapsed() < Duration::from_millis(300));
+        let records = dropped.lock().expect("drop records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].route.provider_identity, "typesafe");
+        let batch = crate::cost_status::take_runtime_usage(owner);
+        assert!(batch.records.is_empty());
+        assert!(batch.drop_records.is_empty());
+        crate::cost_status::finish_runtime_usage_owner(owner);
+    }
+
+    #[tokio::test]
+    async fn owner_lease_retains_late_usage_and_invalid_answer_cost() {
+        let server = MockServer::start().await;
+        let mut body = noul_body(0.9, 0.1);
+        body["answers"]["needs_tool"]["noul"] = 2.0.into();
+        body["usage"]["cost"] = 0.000012054.into();
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_json(body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _env = hermetic_env(Some((&server, 2_000)));
+        let owner = "superfast-late-owner";
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        crate::cost_status::register_runtime_usage_sink(
+            owner,
+            std::sync::Arc::new(move |record| {
+                sink.lock().expect("sink").push(record);
+                true
+            }),
+        );
+        let decisions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let decision_sink = decisions.clone();
+        crate::cost_status::register_runtime_decision_sink(
+            owner,
+            std::sync::Arc::new(move |receipt| {
+                decision_sink.lock().expect("decision sink").push(receipt);
+                true
+            }),
+        );
+        let handle = spawn_shadow_gate(
+            &config(),
+            &turn("hi"),
+            Some(owner),
+            &CancellationToken::new(),
+        )
+        .expect("task");
+        crate::cost_status::finish_runtime_usage_owner(owner);
+        let outcome = handle.await.expect("joined");
+        assert!(matches!(
+            outcome,
+            ShadowOutcome::Failed {
+                failure: AutoRouterFailure::InvalidAnswer,
+                ..
+            }
+        ));
+        let records = observed.lock().expect("records");
+        assert_eq!(
+            records.len(),
+            1,
+            "retired origin still owns its late response"
+        );
+        assert_eq!(records[0].usage.usage.input_tokens, 121);
+        assert_eq!(records[0].usage.usage.output_tokens, 8);
+        assert_eq!(records[0].usage.route.provider_identity, "typesafe");
+        assert_eq!(
+            records[0].usage.route.billing_mode,
+            crate::cost_status::RouteBillingMode::Unknown
+        );
+        let receipts = decisions.lock().expect("decision receipts");
+        assert_eq!(receipts.len(), 1);
+        assert!(!receipts[0].valid_answers);
+        assert!(receipts[0].shadow);
+        assert_eq!(
+            receipts[0].evidence.provider_reported_cost_usd.as_deref(),
+            Some("0.000012054")
+        );
+        assert!(
+            crate::cost_status::take_runtime_usage(owner)
+                .records
+                .is_empty(),
+            "settled response must not enter fallback journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_decision_body_fails_closed_with_dispatched_coverage_gap() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(256 * 1024 + 1)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _env = hermetic_env(Some((&server, 2_000)));
+        let owner = "superfast-oversized-owner";
+        let drops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = drops.clone();
+        crate::cost_status::register_runtime_usage_sink_with_drop(
+            owner,
+            std::sync::Arc::new(|_| true),
+            Some(std::sync::Arc::new(move |record| {
+                sink.lock().expect("drops").push(record);
+                true
+            })),
+        );
+        let handle = spawn_shadow_gate(
+            &config(),
+            &turn("hi"),
+            Some(owner),
+            &CancellationToken::new(),
+        )
+        .expect("task");
+        assert!(matches!(
+            handle.await.expect("joined"),
+            ShadowOutcome::Failed {
+                failure: AutoRouterFailure::InvalidAnswer,
+                ..
+            }
+        ));
+        assert_eq!(drops.lock().expect("drop receipts").len(), 1);
+        crate::cost_status::finish_runtime_usage_owner(owner);
     }
 }
