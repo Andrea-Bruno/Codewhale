@@ -2729,21 +2729,17 @@ async fn process_app_request(
             // that `build_state` used at startup when `config_path` is
             // `None`, so a `None` here reloads from the same on-disk file
             // the server booted from.
-            let store = match ConfigStore::load(state.config_path.clone()) {
-                Ok(store) => store,
-                Err(e) => {
-                    return AppResponse {
-                        ok: false,
-                        data: json!({ "error": format!("{CONFIG_LOAD_ERROR}: {e}") }),
-                        events: Vec::new(),
-                    };
-                }
-            };
             // Disk is already the source of truth here, so nothing to
             // persist. External `permissions.toml` edits reach the Engine
             // because the update invalidates the runtime bridge; the next
             // turn's child loads both files fresh.
-            apply_config_update(state, store.config).await;
+            if let Err(error) = update_config_store(state, |_| Ok(())).await {
+                return AppResponse {
+                    ok: false,
+                    data: json!({ "error": error.to_string() }),
+                    events: Vec::new(),
+                };
+            }
 
             AppResponse {
                 ok: true,
@@ -2810,14 +2806,6 @@ async fn process_app_request(
     }
 }
 
-/// Install a new config snapshot in the shared `state.config`, then
-/// propagate it (see [`propagate_config`]). Used by `ConfigReload`, where
-/// disk is already the source of truth.
-async fn apply_config_update(state: &AppState, snapshot: codewhale_config::ConfigToml) {
-    *state.config.write().await = snapshot;
-    propagate_config(state).await;
-}
-
 /// Push the current `state.config` into the live [`Runtime`] and invalidate
 /// the cached stdio bridge so the next stdio request spawns a fresh child
 /// that reads the new on-disk config. The stdio→runtime thread map survives:
@@ -2861,6 +2849,21 @@ async fn persist_config_mutation(
     state: &AppState,
     mutate: impl FnOnce(&mut codewhale_config::ConfigToml) -> Result<()> + Send + 'static,
 ) -> Result<()> {
+    update_config_store(state, move |store| {
+        mutate(&mut store.config)?;
+        store
+            .save()
+            .map_err(|err| anyhow!("{CONFIG_SAVE_ERROR}: {err}"))
+    })
+    .await
+}
+
+/// Serialize reloads and writes before reading disk, and finish propagation
+/// even if the requesting connection disappears. A reload mutates nothing.
+async fn update_config_store(
+    state: &AppState,
+    update: impl FnOnce(&mut ConfigStore) -> Result<()> + Send + 'static,
+) -> Result<()> {
     let state = state.clone();
     tokio::spawn(async move {
         {
@@ -2870,10 +2873,7 @@ async fn persist_config_mutation(
             let mut config = state.config.write().await;
             let mut store = ConfigStore::load(state.config_path.clone())
                 .map_err(|err| anyhow!("{CONFIG_LOAD_ERROR}: {err}"))?;
-            mutate(&mut store.config)?;
-            store
-                .save()
-                .map_err(|err| anyhow!("{CONFIG_SAVE_ERROR}: {err}"))?;
+            update(&mut store)?;
             *config = store.config;
         }
         propagate_config(&state).await;
@@ -3409,7 +3409,7 @@ mod tests {
     #[tokio::test]
     async fn config_update_keeps_the_stdio_thread_mapping() {
         crate::install_test_crypto_provider();
-        // #6246: `apply_config_update` rebuilds the bridge child, but runtime
+        // #6246: config reload rebuilds the bridge child, but runtime
         // threads are durable — the fresh child resolves the same ids. The
         // bug dropped the stdio→runtime map with the old bridge, so the next
         // `thread/message` silently minted a new runtime thread instead of
@@ -3423,9 +3423,12 @@ mod tests {
             .insert("stdio-keep".to_string(), "thr_keep".to_string());
         seed_bridge_at(&state, base_url.clone()).await;
 
-        // An unrelated config snapshot still rebuilds the bridge child.
-        let snapshot = state.config.read().await.clone();
-        apply_config_update(&state, snapshot).await;
+        // Reloading unchanged config still rebuilds the bridge child.
+        assert!(
+            process_app_request(&state, AppRequest::ConfigReload, AppTransport::Stdio)
+                .await
+                .ok
+        );
         assert!(
             state.runtime_bridge.lock().await.is_none(),
             "config update must drop the cached bridge",
@@ -3987,6 +3990,113 @@ mod tests {
         assert_eq!(
             state.config.read().await.model.as_deref(),
             Some("deepseek-reasoner"),
+        );
+    }
+
+    #[tokio::test]
+    async fn config_reload_reads_disk_after_the_earlier_queued_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "model = \"deepseek-chat\"\n").unwrap();
+        let state = build_state(Some(config_path.clone()), None).unwrap();
+        let reader = state.config.read().await;
+        let set_state = state.clone();
+        let set = tokio::spawn(async move {
+            process_app_request(
+                &set_state,
+                AppRequest::ConfigSet {
+                    key: "model".into(),
+                    value: "deepseek-reasoner".into(),
+                },
+                AppTransport::Http,
+            )
+            .await
+        });
+        // Tokio's writer-preferring lock rejects new readers only once the
+        // first writer is queued. Keep the original reader until reload has
+        // also been polled, deterministically reproducing the stale-load race.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.config.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut reload = Box::pin(process_app_request(
+            &state,
+            AppRequest::ConfigReload,
+            AppTransport::Http,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reload.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(reader);
+        assert!(set.await.unwrap().ok);
+        assert!(reload.await.ok);
+        assert_eq!(
+            state.config.read().await.model.as_deref(),
+            Some("deepseek-reasoner")
+        );
+        assert_eq!(
+            state.runtime.read().await.config.model.as_deref(),
+            Some("deepseek-reasoner")
+        );
+        assert_eq!(
+            ConfigStore::load(Some(config_path))
+                .unwrap()
+                .config
+                .model
+                .as_deref(),
+            Some("deepseek-reasoner")
+        );
+    }
+
+    #[tokio::test]
+    async fn config_reload_finishes_propagation_when_the_caller_goes_away() {
+        crate::install_test_crypto_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "model = \"deepseek-chat\"\n").unwrap();
+        let state = build_state(Some(config_path.clone()), None).unwrap();
+        *state.runtime_bridge.lock().await = Some(sentinel_bridge());
+        fs::write(&config_path, "model = \"deepseek-reasoner\"\n").unwrap();
+        let reader = state.runtime.read().await;
+        let mut reload = Box::pin(process_app_request(
+            &state,
+            AppRequest::ConfigReload,
+            AppTransport::Http,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reload.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.config.read().await.model.as_deref() != Some("deepseek-reasoner") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(reload);
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.runtime_bridge.lock().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reload propagation outlives its caller");
+        assert_eq!(
+            state.runtime.read().await.config.model.as_deref(),
+            Some("deepseek-reasoner")
+        );
+        assert_eq!(
+            fs::read_to_string(config_path).unwrap(),
+            "model = \"deepseek-reasoner\"\n",
+            "reload must not rewrite the file"
         );
     }
 
