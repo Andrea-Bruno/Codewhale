@@ -1551,8 +1551,17 @@ async fn auto_route_decision_recommendation(
     let route = inventory
         .router_decision_route
         .ok_or_else(|| anyhow::anyhow!("decision router has no route"))?;
-    let client =
-        CodewhaleClient::for_decision_route(config, route, inventory.router_base_url.as_deref())?;
+    // Resolve environment/keyring credentials off the async worker.
+    let decision_config = config.clone();
+    let base_url = inventory.router_base_url.clone();
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
+    let client = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
+        CodewhaleClient::for_decision_route(&decision_config, route, base_url.as_deref())
+    })
+    .await??;
     let body = decision_request_body(
         &client,
         &inventory.router_model,
@@ -1584,8 +1593,10 @@ async fn auto_route_decision_recommendation(
             _ => InventoryAutoRouteAttempt::failed(AutoRouterFailure::Timeout),
         },
         Ok(Err(failure)) => match request_route {
-            Some(route) => auto_route_attempt_with_dropped_response(route, failure),
-            None => InventoryAutoRouteAttempt::failed(failure),
+            Some(route) if dispatched.load(std::sync::atomic::Ordering::Acquire) => {
+                auto_route_attempt_with_dropped_response(route, failure)
+            }
+            _ => InventoryAutoRouteAttempt::failed(failure),
         },
         Ok(Ok(response)) => decision_attempt_from_response(
             config.auto_cost_saving(),
@@ -1666,7 +1677,9 @@ pub(crate) fn decision_usage_batch(
     let source_id =
         auto_route_usage_source_id(request_route, response.id.as_deref().unwrap_or("systemone"));
     let route = request_route.sanitized_for_persistence();
-    if auto_route_usage_has_reported_data(&usage) {
+    if response.usage.as_ref().is_some_and(|u| u.complete)
+        && auto_route_usage_has_reported_data(&usage)
+    {
         crate::cost_status::RuntimeUsageBatch {
             decisions: Vec::new(),
             records: vec![RuntimeUsageRecord {

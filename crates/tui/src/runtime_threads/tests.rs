@@ -22003,6 +22003,7 @@ async fn decision_receipt_lease_persists_terminal_turn_and_replays_exactly_once(
         );
     }
     drop(lease);
+    drop(manager);
     let restarted = test_manager(directory)?;
     let reloaded = restarted.store.load_turn(&turn.id)?;
     assert_eq!(reloaded.status, RuntimeTurnStatus::Completed);

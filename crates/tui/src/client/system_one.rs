@@ -161,15 +161,36 @@ pub(crate) struct SystemOneAnswer {
 
 /// Provider usage. OpenRouter adds `cost`; the token-count casing differs
 /// between surfaces, so both spellings are accepted.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct SystemOneUsage {
     /// Kept verbatim so the receipt never re-renders a float.
-    #[serde(default)]
     pub(crate) cost: Option<Box<RawValue>>,
-    #[serde(default, alias = "inputTokens")]
     pub(crate) input_tokens: u32,
-    #[serde(default, alias = "outputTokens")]
     pub(crate) output_tokens: u32,
+    pub(crate) complete: bool,
+}
+
+impl<'de> Deserialize<'de> for SystemOneUsage {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireUsage {
+            #[serde(default)]
+            cost: Option<Box<RawValue>>,
+            #[serde(default, alias = "inputTokens")]
+            input_tokens: Option<u32>,
+            #[serde(default, alias = "outputTokens")]
+            output_tokens: Option<u32>,
+        }
+        let wire = WireUsage::deserialize(deserializer)?;
+        Ok(Self {
+            complete: wire.input_tokens.is_some() && wire.output_tokens.is_some(),
+            input_tokens: wire.input_tokens.unwrap_or(0),
+            output_tokens: wire.output_tokens.unwrap_or(0),
+            cost: wire.cost,
+        })
+    }
 }
 
 impl SystemOneUsage {
@@ -313,6 +334,8 @@ fn valid_decision_request(body: &Value) -> bool {
     let Some(questions) = body.get("questions").and_then(Value::as_object) else {
         return false;
     };
+    let supported_value =
+        |value: &Value| matches!(value, Value::String(_) | Value::Object(_) | Value::Array(_));
     let model = body.get("model").and_then(Value::as_str);
     model.is_some_and(|m| !m.trim().is_empty() && m.len() <= 256)
         && body.get("state").is_some_and(|state| {
@@ -327,11 +350,21 @@ fn valid_decision_request(body: &Value) -> bool {
                 Some("choice") => q
                     .get("criteria")
                     .and_then(Value::as_object)
-                    .is_some_and(|c| !c.is_empty() && c.len() <= 64),
+                    .is_some_and(|c| {
+                        !c.is_empty()
+                            && c.len() <= 64
+                            && c.iter().all(|(name, v)| {
+                                !name.trim().is_empty()
+                                    && name.len() <= 128
+                                    && (v.is_null() || supported_value(v))
+                            })
+                    }),
                 Some("score") => q
                     .get("criteria")
                     .and_then(Value::as_array)
-                    .is_some_and(|c| !c.is_empty() && c.len() <= 10),
+                    .is_some_and(|c| {
+                        !c.is_empty() && c.len() <= 10 && c.iter().all(supported_value)
+                    }),
                 _ => false,
             })
 }
@@ -344,7 +377,7 @@ fn valid_decision_response(body: &Value, response: &SystemOneResponse) -> bool {
         .model
         .as_deref()
         .is_some_and(|m| !m.trim().is_empty() && m.len() <= 256)
-        && response.usage.is_some()
+        && response.usage.as_ref().is_some_and(|usage| usage.complete)
         && response.answers.len() == questions.len()
         && questions.iter().all(|(name, question)| {
             let Some(answer) = response.answers.get(name) else {
@@ -368,6 +401,9 @@ fn valid_decision_response(body: &Value, response: &SystemOneResponse) -> bool {
                     let Some(criteria) = question.get("criteria").and_then(Value::as_array) else {
                         return false;
                     };
+                    if criteria.is_empty() || criteria.len() > 10 {
+                        return false;
+                    }
                     let Some(score) = answer.score else {
                         return false;
                     };
@@ -487,6 +523,7 @@ mod decisions_compatibility_tests {
             ("/answers/urgency/confidence", json!(1.1)),
             ("/model", Value::Null),
             ("/usage", Value::Null),
+            ("/usage", json!({"input_tokens": 287, "cost":0.000012054})),
             ("/answers", json!({})),
         ];
         for (pointer, value) in changes {
@@ -598,5 +635,30 @@ mod decisions_compatibility_tests {
                 .provider_identity,
             "typesafe"
         );
+    }
+    #[test]
+    fn decision_partial_usage_retains_raw_cost_but_cannot_authorize_policy() {
+        let mut body = response();
+        body["usage"] = json!({"inputTokens": 287, "cost": 0.000012054});
+        let decoded: SystemOneResponse = serde_json::from_value(body).expect("partial receipt");
+        assert!(!valid_decision_response(&request(), &decoded));
+        let usage = decoded.usage.expect("reported usage");
+        assert!(!usage.complete);
+        assert_eq!(usage.input_tokens, 287);
+        assert_eq!(usage.reported_cost().as_deref(), Some("0.000012054"));
+        let route = crate::cost_status::decision_receipt_fixture("partial").route;
+        let mut body = response();
+        body["usage"] = json!({"inputTokens": 287, "cost": 0.000012054});
+        let response: SystemOneResponse = serde_json::from_value(body).expect("partial response");
+        let batch = crate::model_routing::decision_usage_batch(&route, &response);
+        assert!(
+            batch.records.is_empty(),
+            "a partial token count cannot produce a complete priced subtotal"
+        );
+        assert_eq!(batch.dropped_records, 1);
+        assert_eq!(batch.drop_records.len(), 1);
+        let mut invalid = request();
+        invalid["questions"]["urgency"]["criteria"] = json!([null]);
+        assert!(!valid_decision_request(&invalid));
     }
 }

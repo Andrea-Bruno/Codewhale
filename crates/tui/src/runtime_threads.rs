@@ -9473,7 +9473,19 @@ impl RuntimeThreadManager {
                 }
                 for receipt in &turn.decision_receipts {
                     if usage_timestamp_in_range(receipt.route.dispatched_at, since, until) {
-                        totals.route_receipts.insert(receipt.diagnostic_receipt());
+                        if totals
+                            .route_receipts
+                            .iter()
+                            .filter(|r| r.starts_with("decision:"))
+                            .count()
+                            < 64
+                        {
+                            totals.route_receipts.insert(receipt.diagnostic_receipt());
+                        } else {
+                            totals
+                                .route_receipts
+                                .insert("decision:diagnostic_receipt_bound_reached".to_string());
+                        }
                     }
                 }
                 for child in &turn.routed_usage {

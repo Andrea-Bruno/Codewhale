@@ -1809,7 +1809,7 @@ impl SessionManager {
             turn_id,
             &receipt.source_id,
             &receipt.route,
-            receipt.usage.as_ref(),
+            receipt.usage.as_ref().filter(|_| receipt.usage_complete),
             Some(receipt),
         )
     }
@@ -4279,6 +4279,30 @@ mod tests {
             !fs::read_to_string(&ledger)
                 .expect("ledger")
                 .contains("raw-decision-response-id")
+        );
+        save_late_usage_test_session(&manager, "decision-partial-origin");
+        let mut partial = receipt.clone();
+        partial.source_id = "partial-provider-response-id".into();
+        partial.usage_complete = false;
+        partial.usage.as_mut().expect("partial usage").output_tokens = 0;
+        manager
+            .persist_late_decision_receipt("decision-partial-origin", "partial-turn", &partial)
+            .expect("partial diagnostic append");
+        let partial_session = manager
+            .load_session_snapshot("decision-partial-origin")
+            .expect("partial replay");
+        assert_eq!(
+            partial_session.metadata.total_tokens, 0,
+            "partial provider counters remain diagnostic rather than an authoritative subtotal"
+        );
+        assert_eq!(partial_session.metadata.cost.unpriced_turns, 1);
+        assert!(
+            partial_session
+                .metadata
+                .cost
+                .route_receipts
+                .iter()
+                .any(|r| r.contains("0.000012054"))
         );
         manager.delete_session("decision-origin").expect("delete");
         assert!(

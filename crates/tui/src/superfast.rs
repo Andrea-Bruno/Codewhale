@@ -85,6 +85,7 @@ struct ShadowUsageContext {
 
 impl ShadowUsageContext {
     fn capture(owner: Option<&str>) -> Self {
+        let owner = owner.map(str::trim).filter(|owner| !owner.is_empty());
         Self {
             scope: crate::cost_status::scope_token(),
             runtime_owner: owner.map(str::to_owned),
@@ -409,6 +410,10 @@ async fn evaluate(
                         output_tokens: u.output_tokens,
                         ..Default::default()
                     }),
+                    usage_complete: response
+                        .usage
+                        .as_ref()
+                        .is_some_and(|u| u.complete && (u.input_tokens > 0 || u.output_tokens > 0)),
                     shadow: true,
                     valid_answers: response.answers_validated != Some(false),
                     evidence: crate::model_routing::AutoRouteDecisionEvidence {
@@ -1123,5 +1128,35 @@ mod tests {
         ));
         assert_eq!(drops.lock().expect("drop receipts").len(), 1);
         crate::cost_status::finish_runtime_usage_owner(owner);
+    }
+    #[tokio::test]
+    async fn empty_origin_and_receipt_only_batch_use_the_existing_interactive_pool() {
+        let _scope = crate::cost_status::test_scope();
+        let context = ShadowUsageContext::capture(Some("  "));
+        assert!(context.runtime_owner.is_none());
+        context
+            .report(crate::cost_status::RuntimeUsageBatch {
+                decisions: vec![crate::cost_status::decision_receipt_fixture(
+                    "ownerless-fixture",
+                )],
+                ..Default::default()
+            })
+            .await;
+        let projected = crate::cost_status::drain();
+        assert!(
+            projected
+                .route_receipts
+                .iter()
+                .any(|r| r.contains("0.000012054"))
+        );
+        assert_eq!(
+            projected.unpriced_turns, 0,
+            "diagnostic receipts do not mint a new charge"
+        );
+        assert!(
+            crate::cost_status::take_runtime_usage("  ")
+                .decisions
+                .is_empty()
+        );
     }
 }

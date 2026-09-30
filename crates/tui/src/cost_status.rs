@@ -667,7 +667,7 @@ pub fn child_usage_records_from_metadata(
     if let Some(decisions) = metadata.get(CHILD_DECISION_RECEIPTS_KEY) {
         if let Some(values) = decisions.as_array() {
             for value in values.iter().take(MAX_CHILD_USAGE_RECORDS) {
-                let bounded = serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 16 * 1024);
+                let bounded = serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 8 * 1024);
                 let parsed = bounded
                     .then(|| serde_json::from_value::<RuntimeDecisionReceipt>(value.clone()).ok())
                     .flatten();
@@ -905,6 +905,8 @@ pub struct RuntimeDecisionReceipt {
     pub source_id: String,
     pub route: EffectiveRouteEnvelope,
     pub usage: Option<Usage>,
+    #[serde(default)]
+    pub usage_complete: bool,
     pub shadow: bool,
     pub valid_answers: bool,
     pub evidence: crate::model_routing::AutoRouteDecisionEvidence,
@@ -912,7 +914,8 @@ pub struct RuntimeDecisionReceipt {
 
 impl RuntimeDecisionReceipt {
     pub(crate) fn is_bounded(&self) -> bool {
-        self.source_id.len() <= 128
+        !self.source_id.trim().is_empty()
+            && self.source_id.len() <= 128
             && self.evidence.choice.len() <= 128
             && self.evidence.probabilities_bp.len() <= 64
             && self
@@ -941,15 +944,31 @@ impl RuntimeDecisionReceipt {
                         && v.parse::<f64>()
                             .is_ok_and(|cost| cost.is_finite() && cost >= 0.0)
                 })
-            && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= 16 * 1024)
+            && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= 8 * 1024)
     }
 
     pub(crate) fn sanitized(&self) -> Self {
-        Self {
-            source_id: usage_source_fingerprint(&self.source_id),
-            route: self.route.sanitized_for_persistence(),
-            ..self.clone()
-        }
+        let mut receipt = self.clone();
+        receipt.source_id = usage_source_fingerprint(&receipt.source_id);
+        receipt.route = receipt.route.sanitized_for_persistence();
+        receipt.evidence.choice = sanitize_persisted_route_label(&receipt.evidence.choice);
+        receipt.evidence.thinking = receipt
+            .evidence
+            .thinking
+            .as_deref()
+            .map(sanitize_persisted_route_label);
+        receipt.evidence.response_model = receipt
+            .evidence
+            .response_model
+            .as_deref()
+            .map(sanitize_persisted_route_label);
+        receipt.evidence.probabilities_bp = receipt
+            .evidence
+            .probabilities_bp
+            .into_iter()
+            .map(|(key, value)| (sanitize_persisted_route_label(&key), value))
+            .collect();
+        receipt
     }
 
     pub(crate) fn diagnostic_receipt(&self) -> String {
@@ -994,6 +1013,7 @@ pub(crate) fn decision_receipt_fixture(source_id: &str) -> RuntimeDecisionReceip
             output_tokens: 4,
             ..Default::default()
         }),
+        usage_complete: true,
         shadow: true,
         valid_answers: false,
         evidence: crate::model_routing::AutoRouteDecisionEvidence {
